@@ -7,12 +7,12 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 
-const int adcPin = A0;
-const int outPin = D1; // 继电器或驱动输入引脚，可按接线改
-const int BIT_PERIOD_MS = 10;       // 与发射端保持一致(100bps)
-const int SAMPLE_COUNT = 5;         // 每bit采样次数
-const int SAMPLE_DELAY_MS = 1;      // 单次采样间隔
-const int SAMPLE_HIGH_COUNT = 3;    // 判定为1的最小高电平次数
+const int adcPin = A0;           // NodeMCU 仅有一个 ADC 引脚
+const int outPin = D1;           // NodeMCU D1 作为继电器/驱动输出，可按接线更改
+const int BIT_PERIOD_MS = 10;    // 与发射端保持一致(100bps)
+const int SAMPLE_COUNT = 5;      // 每bit采样次数
+const int SAMPLE_DELAY_MS = 1;   // 单次采样间隔
+const int SAMPLE_HIGH_COUNT = 3; // 判定为1的最小高电平次数
 
 // 1=LIGHT, 2=SERVO, 3=FAN
 const int DEVICE_ROLE = 1;
@@ -157,11 +157,21 @@ void processByte(uint8_t b)
   }
 }
 
+void sendCorsHeaders()
+{
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
 void handleAck()
 {
+  sendCorsHeaders();
   String json = "{\"ok\":true,\"device\":\"";
   json += roleName();
-  json += "\",\"state\":";
+  json += "\",\"connected\":";
+  json += (WiFi.status() == WL_CONNECTED ? "true" : "false");
+  json += ",\"state\":";
   json += (deviceOn ? "1" : "0");
   json += ",\"lastCmd\":\"";
   json += lastCommand;
@@ -173,9 +183,11 @@ void handleAck()
 
 void handleRoot()
 {
+  sendCorsHeaders();
   String html = "<html><head><meta charset='utf-8'><meta http-equiv='refresh' content='1'></head><body style='text-align:center;margin-top:40px'>";
   html += "<h2>VLC接收端</h2>";
   html += "<h3>ROLE: " + roleName() + "</h3>";
+  html += "<h3>WIFI: " + String(WiFi.status() == WL_CONNECTED ? "连接成功" : "未连接") + "</h3>";
   html += "<h3>THRESHOLD: " + String(threshold) + "</h3>";
   html += "<h3>LAST: " + receivedData + "</h3>";
   html += "<h3>STATE: " + String(deviceOn ? "ON" : "OFF") + "</h3>";

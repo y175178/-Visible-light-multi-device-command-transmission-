@@ -1,84 +1,228 @@
 <template>
   <view class="page">
-    <view class="header">
-      <text class="title">ESP32 控制面板</text>
-      <text class="sub-title">1个发射端 + 3个接收端（灯/舵机/风扇）</text>
-    </view>
-
-    <view class="card">
-      <text class="label">发射端设置</text>
-      <view class="ip-row">
-        <input class="ip-input" v-model="txIp" placeholder="发射端IP，如 192.168.186.52" />
-        <button class="btn primary" @click="connectTx">连接</button>
-      </view>
-      <text class="status-text">连接状态：{{ txConnected ? "已连接" : "未连接" }}</text>
-      <text class="status-text">发射端消息：{{ txMessage }}</text>
-    </view>
-
-    <view class="card">
-      <text class="label">指令发送（一排）</text>
-      <view class="command-row">
-        <button class="btn command-btn" @click="toggleDevice('LIGHT')">
-          灯 {{ stateText(deviceStatus.light) }}
-        </button>
-        <button class="btn command-btn" @click="toggleDevice('SERVO')">
-          舵机 {{ stateText(deviceStatus.servo) }}
-        </button>
-        <button class="btn command-btn" @click="toggleDevice('FAN')">
-          风扇 {{ stateText(deviceStatus.fan) }}
-        </button>
-      </view>
-    </view>
-
-    <view class="card">
-      <text class="label">接收端确认状态</text>
-      <view class="receiver-row" v-for="(rx, index) in receivers" :key="rx.id">
-        <view class="receiver-top">
-          <text class="receiver-name">{{ rx.name }}</text>
-          <text class="receiver-state">{{ rx.message }}</text>
+    <!-- 顶部导航栏 -->
+    <view class="header-bar">
+      <view class="header-content">
+        <view class="logo-section">
+          <text class="main-title">VLC 控制面板</text>
         </view>
-        <input class="ip-input single" v-model="rx.ip" :placeholder="rx.placeholder" />
-        <text class="status-text">最近确认：{{ rx.lastCommand }}</text>
       </view>
     </view>
 
-    <view class="card">
-      <text class="label">环境信息</text>
-      <view class="info-row">
-        <text class="info-item">光照 {{ sensorData.light }}</text>
-        <text class="info-item">温度 {{ sensorData.temp }}°C</text>
-        <text class="info-item">湿度 {{ sensorData.hum }}%</text>
+    <scroll-view scroll-y class="main-content">
+      <!-- 主界面 -->
+      <view>
+        <!-- 发射端设置 -->
+        <view class="card">
+          <view class="card-header">
+            <text class="card-title">📡 发射端</text>
+            <view class="card-badge" :class="txConnected ? 'success' : 'error'">
+              {{ txConnected ? "在线" : "离线" }}
+            </view>
+          </view>
+          <view class="card-body">
+            <view class="input-group">
+              <text class="form-label">发射端地址:</text>
+              <input class="form-input" v-model="txIp" placeholder="192.168.1.100:5000" @blur="saveTxIp" />
+            </view>
+            <view class="input-group">
+              <button class="btn btn-primary" :disabled="txConnecting" @click="connectTx">
+                {{ txConnecting ? "连接..." : "重新连接" }}
+              </button>
+              <button class="btn btn-secondary" @click="testConnection">测试连接</button>
+            </view>
+            <view v-if="txIp" class="status-info">
+              <text>当前配置: {{ txBase() }}/data</text>
+            </view>
+            <text v-if="txError" class="form-error">⚠️ {{ txError }}</text>
+            <view style="display: flex; gap: 8rpx; align-items: center;">
+              <view style="width: 12rpx; height: 12rpx; border-radius: 50%; background: var(--text-tertiary); opacity: 0.4;" :style="txConnected ? 'background: var(--success-color); opacity: 1; box-shadow: 0 0 10rpx var(--success-color)' : ''"></view>
+              <text style="font-size: 22rpx; color: var(--text-secondary);">{{ txMessage }}</text>
+            </view>
+          </view>
+        </view>
+
+        <!-- 设备控制 -->
+        <view class="card">
+          <view class="card-header">
+            <text class="card-title">⚡ 设备控制</text>
+          </view>
+          <view class="card-body devices-grid">
+            <!-- 灯 -->
+            <view class="device-card-simple">
+              <text class="device-icon">💡</text>
+              <text class="device-name">灯</text>
+              <view class="device-controls">
+                <button class="device-btn" :class="{ active: deviceStatus.light === 1 }" @click="setDeviceState('LIGHT', 1)" :disabled="commandSending">开</button>
+                <button class="device-btn" :class="{ active: deviceStatus.light === 0 }" @click="setDeviceState('LIGHT', 0)" :disabled="commandSending">关</button>
+              </view>
+            </view>
+
+            <!-- 舵机 -->
+            <view class="device-card-simple">
+              <text class="device-icon">🎚️</text>
+              <text class="device-name">舵机</text>
+              <view class="device-controls">
+                <button class="device-btn" @click="setDeviceState('SERVO', 1)" :disabled="commandSending">启</button>
+                <button class="device-btn" @click="setDeviceState('SERVO', 0)" :disabled="commandSending">停</button>
+              </view>
+            </view>
+
+            <!-- 风扇已移除 -->
+          </view>
+        </view>
+
+        <!-- 接收端状态 -->
+        <view class="card">
+          <view class="card-header">
+            <text class="card-title">📶 接收端</text>
+          </view>
+          <view class="card-body">
+            <view class="receiver-list">
+              <view class="receiver-item" v-for="(rx, idx) in receivers" :key="rx.id">
+                <view class="receiver-info">
+                  <text class="receiver-icon">{{ getReceiverIcon(rx.device) }}</text>
+                  <text class="receiver-name">{{ rx.name }}</text>
+                  <input class="receiver-ip-input" v-model="rx.ip" placeholder="192.168.1.101" @blur="saveReceivers" />
+                </view>
+                <view class="receiver-status" :class="rx.connected ? 'online' : 'offline'">
+                  {{ rx.connected ? "在线" : "离线" }}
+                </view>
+              </view>
+            </view>
+          </view>
+        </view>
+
+        <!-- 底部间距 -->
+        <view style="height: 20rpx;"></view>
       </view>
-    </view>
+    </scroll-view>
   </view>
 </template>
 
 <script setup lang="uts">
 import { onMounted, onUnmounted, reactive, ref } from "vue";
 
+// 主要状态
 const timer = ref<number | null>(null);
-const txIp = ref("192.168.186.52");
-const txConnected = ref(false);
-const txMessage = ref("未连接");
 
+// 发射端配置
+const txIp = ref("");
+const txConnected = ref(false);
+const txConnecting = ref(false);
+const txMessage = ref("未连接");
+const txError = ref("");
+
+// 设备状态
 const deviceStatus = reactive({
   light: 0,
   servo: 0,
   fan: 0
 });
 
-const sensorData = reactive({
-  light: 0,
-  temp: 0,
-  hum: 0
+const commandSending = ref(false);
+const debugLogs = ref<Array<{ time: string; message: string; type: string }>>([]);
+const stats = reactive({
+  totalRequests: 0,
+  successCount: 0,
+  failCount: 0,
+  successRate: 0
 });
 
-const receivers = ref([
-  { id: 1, name: "接收端1（灯）", device: "LIGHT", ip: "", placeholder: "灯接收端IP", lastCommand: "无", message: "未确认" },
-  { id: 2, name: "接收端2（舵机）", device: "SERVO", ip: "", placeholder: "舵机接收端IP", lastCommand: "无", message: "未确认" },
-  { id: 3, name: "接收端3（风扇）", device: "FAN", ip: "", placeholder: "风扇接收端IP", lastCommand: "无", message: "未确认" }
+// 接收端配置
+const receivers = ref<Array<{ id: number; name: string; device: string; ip: string; message: string; connected: boolean }>>([
+  { id: 1, name: "灯", device: "LIGHT", ip: "", message: "未配置IP", connected: false },
+  { id: 2, name: "舵机", device: "SERVO", ip: "", message: "未配置IP", connected: false }
 ]);
 
+// 本地存储管理
+function loadSettings(): void {
+  try {
+    const savedTxIp = uni.getStorageSync("txIp");
+    if (savedTxIp) {
+      txIp.value = savedTxIp;
+    }
+    
+    const savedReceivers = uni.getStorageSync("receivers");
+    if (savedReceivers) {
+      const parsed = JSON.parse(savedReceivers);
+      // 只更新IP地址，保持其他属性不变
+      receivers.value.forEach((rx, index) => {
+        if (parsed[index] && parsed[index].ip) {
+          rx.ip = parsed[index].ip;
+        }
+      });
+    }
+  } catch (e) {
+    addLog("加载设置失败", "error");
+  }
+}
+
+function saveTxIp(): void {
+  if (!validateIp(txIp.value)) {
+    uni.showToast({ title: "IP格式不正确", icon: "none" });
+    return;
+  }
+  try {
+    uni.setStorageSync("txIp", txIp.value);
+    addLog("发射端IP已保存", "info");
+  } catch (e) {
+    addLog("保存发射端IP失败", "error");
+  }
+}
+
+function saveReceivers(): void {
+  let hasInvalid = false;
+  receivers.value.forEach(rx => {
+    if (rx.ip.trim() && !validateIp(rx.ip)) {
+      hasInvalid = true;
+      uni.showToast({ title: `${rx.name} IP格式不正确`, icon: "none" });
+    }
+  });
+  
+  if (hasInvalid) return;
+  
+  try {
+    uni.setStorageSync("receivers", JSON.stringify(receivers.value));
+    addLog("接收端配置已保存", "info");
+  } catch (e) {
+    addLog("保存接收端配置失败", "error");
+  }
+}
+
+function validateIp(ip: string): boolean {
+  if (!ip || !ip.trim()) return true; // 允许空值
+  
+  const trimmed = ip.trim();
+  
+  // 检查是否包含端口
+  const parts = trimmed.split(':');
+  if (parts.length > 2) return false;
+  
+  const ipPart = parts[0];
+  const portPart = parts[1];
+  
+  // 检查IP地址格式
+  const ipRegex = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+  const match = ipPart.match(ipRegex);
+  if (!match) return false;
+  
+  // 检查每个部分是否在0-255范围内
+  for (let i = 1; i <= 4; i++) {
+    const num = parseInt(match[i]);
+    if (num < 0 || num > 255) return false;
+  }
+  
+  // 检查端口（如果有的话）
+  if (portPart) {
+    const port = parseInt(portPart);
+    if (isNaN(port) || port < 1 || port > 65535) return false;
+  }
+  
+  return true;
+}
+
+// 工具函数
 function parseResponseData(raw: any): any {
   if (typeof raw === "string") {
     const normalized = raw.replace(/'/g, "\"");
@@ -95,8 +239,18 @@ function normalizeHost(host: string, defaultPort: string): string {
   let h = host.trim();
   if (h.startsWith("http://")) h = h.substring(7);
   else if (h.startsWith("https://")) h = h.substring(8);
+  if (h.endsWith("/")) h = h.slice(0, -1);
+  if (h.includes("/")) h = h.split("/")[0];
   if (h.length > 0 && !h.includes(":")) h = h + ":" + defaultPort;
   return h;
+}
+
+function getFormattedTime(): string {
+  const now = new Date();
+  const hours = String(now.getHours()).padStart(2, "0");
+  const minutes = String(now.getMinutes()).padStart(2, "0");
+  const seconds = String(now.getSeconds()).padStart(2, "0");
+  return `${hours}:${minutes}:${seconds}`;
 }
 
 function txBase(): string {
@@ -107,22 +261,137 @@ function rxBase(ip: string): string {
   return "http://" + normalizeHost(ip, "80");
 }
 
-function stateText(v: number): string {
-  return v === 1 ? "开" : "关";
+function getReceiverIcon(device: string): string {
+  if (device === "LIGHT") return "💡";
+  if (device === "SERVO") return "🎚️";
+  if (device === "FAN") return "🌀";
+  return "📦";
 }
 
+function addLog(message: string, type: string = "info"): void {
+  const time = getFormattedTime();
+  debugLogs.value.push({ time, message, type });
+  if (debugLogs.value.length > 50) {
+    debugLogs.value.shift();
+  }
+}
+
+function updateStats(success: boolean): void {
+  stats.totalRequests++;
+  if (success) {
+    stats.successCount++;
+  } else {
+    stats.failCount++;
+  }
+  stats.successRate = stats.totalRequests > 0 ? Math.round((stats.successCount / stats.totalRequests) * 100) : 0;
+}
+
+// UI交互
+function validateTxIp(): void {
+  const ip = txIp.value.trim();
+  if (ip.length === 0) {
+    txError.value = "IP地址不能为空";
+  } else {
+    txError.value = "";
+  }
+}
+
+function testConnection(): void {
+  addLog("开始测试网络连接...", "info");
+  
+  // 检查网络状态
+  uni.getNetworkType({
+    success: (res) => {
+      addLog(`网络类型: ${res.networkType}, 连接状态: ${res.isConnected ? '已连接' : '未连接'}`, "info");
+    },
+    fail: (err) => {
+      addLog(`获取网络状态失败: ${JSON.stringify(err)}`, "error");
+    }
+  });
+  
+  // 测试发射端连接
+  if (txIp.value.trim()) {
+    uni.request({
+      method: "GET",
+      url: txBase() + "/data",
+      timeout: 5000,
+      success: (res: any) => {
+        addLog(`发射端连接成功: ${JSON.stringify(res)}`, "success");
+        uni.showToast({ title: "发射端连接成功", icon: "none" });
+      },
+      fail: (err: any) => {
+        addLog(`发射端连接失败: ${JSON.stringify(err)}`, "error");
+        uni.showToast({ title: "发射端连接失败", icon: "none" });
+      }
+    });
+  } else {
+    addLog("发射端IP未配置", "error");
+    uni.showToast({ title: "请先配置发射端IP", icon: "none" });
+  }
+  
+  // 测试接收端连接
+  receivers.value.forEach((rx) => {
+    if (rx.ip.trim()) {
+      uni.request({
+        method: "GET",
+        url: rxBase(rx.ip) + "/ack",
+        timeout: 5000,
+        success: (res: any) => {
+          addLog(`接收端 ${rx.name} 连接成功: ${JSON.stringify(res)}`, "success");
+          uni.showToast({ title: `${rx.name}连接成功`, icon: "none" });
+        },
+        fail: (err: any) => {
+          addLog(`接收端 ${rx.name} 连接失败: ${JSON.stringify(err)}`, "error");
+          uni.showToast({ title: `${rx.name}连接失败`, icon: "none" });
+        }
+      });
+    } else {
+      addLog(`接收端 ${rx.name} IP未配置`, "error");
+    }
+  });
+}
+
+// 连接与同步
 function connectTx(): void {
   const host = normalizeHost(txIp.value, "5000");
   if (host.length === 0) {
+    txError.value = "请输入发射端IP";
     uni.showToast({ title: "请输入发射端IP", icon: "none" });
     return;
   }
-  txIp.value = host;
-  txConnected.value = true;
-  txMessage.value = "已连接";
-  uni.showToast({ title: "发射端连接成功", icon: "none" });
-  syncTx();
-  syncAllReceivers();
+
+  txConnecting.value = true;
+  txError.value = "";
+  txMessage.value = "连接中...";
+  addLog(`正在连接: ${host}`, "info");
+
+  uni.request({
+    method: "GET",
+    url: txBase() + "/data",
+    timeout: 3000,
+    success: (res: any) => {
+      addLog(`发射端响应: ${JSON.stringify(res.data)}`, "info");
+      const data = parseResponseData(res.data);
+      txConnected.value = true;
+      txConnecting.value = false;
+      txMessage.value = "在线";
+      txError.value = "";
+      addLog("发射端连接成功", "success");
+      uni.showToast({ title: "连接成功", icon: "none" });
+      updateStats(true);
+      syncAllReceivers();
+    },
+    fail: (err: any) => {
+      addLog(`发射端连接失败详情: ${JSON.stringify(err)}`, "error");
+      txConnected.value = false;
+      txConnecting.value = false;
+      txMessage.value = "离线";
+      txError.value = "无法连接";
+      addLog(`连接失败: ${err}`, "error");
+      uni.showToast({ title: "连接失败", icon: "none" });
+      updateStats(false);
+    }
+  });
 }
 
 function syncTx(): void {
@@ -131,40 +400,50 @@ function syncTx(): void {
   uni.request({
     method: "GET",
     url: txBase() + "/data",
+    timeout: 2000,
     success: (res: any) => {
       const data = parseResponseData(res.data);
-      sensorData.light = Number(data.light ?? 0);
-      sensorData.temp = Number(data.temp ?? 0);
-      sensorData.hum = Number(data.hum ?? 0);
       txMessage.value = "在线";
+      updateStats(true);
     },
     fail: () => {
-      txMessage.value = "发射端离线";
+      txConnected.value = false;
+      txMessage.value = "离线";
+      updateStats(false);
     }
   });
 }
 
-function setDeviceStateByReceiver(device: string, val: number): void {
-  if (device === "LIGHT") deviceStatus.light = val;
-  if (device === "SERVO") deviceStatus.servo = val;
-  if (device === "FAN") deviceStatus.fan = val;
-}
-
 function syncReceiverAck(rxIndex: number): void {
   const rx = receivers.value[rxIndex];
-  if (rx.ip.trim().length === 0) return;
+  if (rx.ip.trim().length === 0) {
+    rx.connected = false;
+    rx.message = "未填IP";
+    return;
+  }
 
   uni.request({
     method: "GET",
     url: rxBase(rx.ip) + "/ack",
+    timeout: 2000,
     success: (res: any) => {
+      addLog(`接收端 ${rx.name} 响应: ${JSON.stringify(res.data)}`, "info");
       const data = parseResponseData(res.data);
-      const ackCmd = String(data.lastCmd ?? "");
       const state = Number(data.state ?? -1);
+      
+      rx.connected = true;
       if (state === 0 || state === 1) {
         setDeviceStateByReceiver(rx.device, state);
       }
-      if (ackCmd.length > 0) rx.lastCommand = ackCmd;
+      rx.message = "在线";
+      
+      updateStats(true);
+    },
+    fail: (err: any) => {
+      addLog(`接收端 ${rx.name} 连接失败: ${rx.ip}/ack`, "error");
+      rx.connected = false;
+      rx.message = "离线";
+      updateStats(false);
     }
   });
 }
@@ -173,72 +452,143 @@ function syncAllReceivers(): void {
   receivers.value.forEach((_, index) => syncReceiverAck(index));
 }
 
-function toggleDevice(device: string): void {
+function setDeviceStateByReceiver(device: string, val: number): void {
+  if (device === "LIGHT") deviceStatus.light = val;
+  if (device === "SERVO") deviceStatus.servo = val;
+  if (device === "FAN") deviceStatus.fan = val;
+}
+
+// 设备控制
+function setDeviceState(device: string, state: number): void {
   if (!txConnected.value) {
     uni.showToast({ title: "请先连接发射端", icon: "none" });
     return;
   }
 
-  let current = 0;
-  if (device === "LIGHT") current = deviceStatus.light;
-  if (device === "SERVO") current = deviceStatus.servo;
-  if (device === "FAN") current = deviceStatus.fan;
-  const cmd = current === 1 ? device + "_OFF" : device + "_ON";
+  if (commandSending.value) return;
 
-  const rxIndex = receivers.value.findIndex((x) => x.device === device);
-  if (rxIndex >= 0) {
-    receivers.value[rxIndex].message = "等待ACK...";
-    receivers.value[rxIndex].lastCommand = cmd;
+  let cmd = "";
+  if (device === "LIGHT") {
+    cmd = state === 1 ? "LIGHT_ON" : "LIGHT_OFF";
+  } else if (device === "SERVO") {
+    cmd = state === 1 ? "SERVO_ON" : "SERVO_OFF";
+  } else if (device === "FAN") {
+    cmd = state === 1 ? "FAN_ON" : "FAN_OFF";
   }
+
+  commandSending.value = true;
+  addLog(`发送: ${cmd}`, "info");
 
   uni.request({
     method: "GET",
     url: txBase() + "/control?cmd=" + cmd,
+    timeout: 6000,
     success: () => {
       uni.vibrateShort();
-      if (rxIndex >= 0) waitAck(rxIndex, cmd, 0);
+      addLog(`${cmd} 成功`, "success");
+      
+      const rxIndex = receivers.value.findIndex((x) => x.device === device);
+      if (rxIndex >= 0) {
+        waitAck(rxIndex, cmd, 0);
+      } else {
+        commandSending.value = false;
+      }
+      
+      updateStats(true);
     },
-    fail: () => {
-      txMessage.value = "发射失败";
+    fail: (err: any) => {
+      commandSending.value = false;
+      addLog(`${cmd} 失败: ${JSON.stringify(err)}`, "error");
       uni.showToast({ title: "发送失败", icon: "none" });
+      updateStats(false);
     }
   });
 }
 
 function waitAck(rxIndex: number, cmd: string, retry: number): void {
-  const maxRetry = 8;
+  const maxRetry = 6;
   const rx = receivers.value[rxIndex];
 
   if (rx.ip.trim().length === 0) {
-    rx.message = "未填接收端IP";
+    rx.message = "未填IP";
+    commandSending.value = false;
     return;
   }
 
   uni.request({
     method: "GET",
     url: rxBase(rx.ip) + "/ack",
+    timeout: 2000,
     success: (res: any) => {
       const data = parseResponseData(res.data);
       const ackCmd = String(data.lastCmd ?? "");
+      
+      rx.connected = true;
+      
       if (ackCmd === cmd) {
-        rx.message = "确认成功";
+        rx.message = "✓";
         setDeviceStateByReceiver(rx.device, Number(data.state ?? 0));
+        commandSending.value = false;
+        
+        // 临时显示成功状态，2秒后恢复
+        setTimeout(() => {
+          if (rx.message === "✓") {
+            rx.message = "在线";
+          }
+        }, 2000);
+        
         syncTx();
+        updateStats(true);
         return;
       }
-      if (retry < maxRetry) setTimeout(() => waitAck(rxIndex, cmd, retry + 1), 600);
-      else rx.message = "确认超时";
+
+      if (retry < maxRetry) {
+        setTimeout(() => waitAck(rxIndex, cmd, retry + 1), 500);
+      } else {
+        rx.message = "✗";
+        commandSending.value = false;
+        
+        // 临时显示失败状态，2秒后恢复
+        setTimeout(() => {
+          if (rx.message === "✗") {
+            rx.message = "在线";
+          }
+        }, 2000);
+        
+        addLog(`${cmd} 确认超时`, "warn");
+        updateStats(false);
+      }
     },
     fail: () => {
-      if (retry < maxRetry) setTimeout(() => waitAck(rxIndex, cmd, retry + 1), 600);
-      else rx.message = "ACK失败";
+      if (retry < maxRetry) {
+        setTimeout(() => waitAck(rxIndex, cmd, retry + 1), 500);
+      } else {
+        rx.connected = false;
+        rx.message = "✗";
+        commandSending.value = false;
+        
+        setTimeout(() => {
+          if (rx.message === "✗") {
+            rx.message = "离线";
+          }
+        }, 2000);
+        
+        addLog(`${cmd} 确认失败`, "error");
+        updateStats(false);
+      }
     }
   });
 }
 
+// 生命周期
 onMounted(() => {
+  addLog("应用启动", "info");
+  loadSettings();
+
   timer.value = setInterval(() => {
-    if (txConnected.value) syncTx();
+    if (txConnected.value) {
+      syncTx();
+    }
     syncAllReceivers();
   }, 5000);
 });
@@ -249,24 +599,399 @@ onUnmounted(() => {
 </script>
 
 <style>
-.page { min-height: 100vh; background-color: #f4f6fb; padding: 24rpx; }
-.header { margin-bottom: 20rpx; }
-.title { font-size: 40rpx; font-weight: 600; color: #1f2937; }
-.sub-title { margin-top: 8rpx; font-size: 25rpx; color: #6b7280; }
-.card { background: #fff; border-radius: 16rpx; padding: 20rpx; margin-bottom: 16rpx; }
-.label { font-size: 28rpx; color: #111827; font-weight: 500; }
-.ip-row { display: flex; align-items: center; margin-top: 12rpx; }
-.ip-input { flex: 1; background: #f3f4f6; border-radius: 12rpx; padding: 14rpx; margin-right: 8rpx; }
-.ip-input.single { margin-top: 8rpx; margin-right: 0; }
-.status-text { margin-top: 8rpx; color: #6b7280; font-size: 24rpx; }
-.btn { border: 0; border-radius: 12rpx; padding: 8rpx 20rpx; background-color: #e5e7eb; color: #111827; font-size: 24rpx; }
-.btn.primary { background-color: #2563eb; color: #fff; }
-.command-row { display: flex; justify-content: space-between; margin-top: 14rpx; }
-.command-btn { width: 31%; background-color: #eef2ff; color: #3730a3; }
-.receiver-row { margin-top: 14rpx; padding: 12rpx; border-radius: 12rpx; background: #f9fafb; }
-.receiver-top { display: flex; justify-content: space-between; align-items: center; }
-.receiver-name { font-size: 26rpx; color: #111827; }
-.receiver-state { font-size: 24rpx; color: #4b5563; }
-.info-row { display: flex; justify-content: space-between; margin-top: 12rpx; }
-.info-item { width: 32%; text-align: center; padding: 14rpx 8rpx; background: #f9fafb; border-radius: 12rpx; color: #374151; font-size: 24rpx; }
+/* ===== 页面布局 ===== */
+.page {
+  --bg-primary: #ffffff;
+  --bg-secondary: #f8f9fa;
+  --bg-tertiary: #f0f2f5;
+  --text-primary: #1a1a1a;
+  --text-secondary: #666666;
+  --text-tertiary: #999999;
+  --border-color: #e0e0e0;
+  --brand-primary: #0e6fee;
+  --brand-secondary: #2d7de4;
+  --success-color: #10b981;
+  --error-color: #ef4444;
+  --warning-color: #f59e0b;
+  --info-color: #3b82f6;
+  --shadow: 0 2rpx 8rpx rgba(0, 0, 0, 0.08);
+
+  min-height: 100vh;
+  background-color: var(--bg-secondary);
+  color: var(--text-primary);
+  transition: background-color 0.3s, color 0.3s;
+}
+
+.main-content {
+  max-width: 1200rpx;
+  margin: 0 auto;
+  padding: 0 24rpx 20rpx;
+}
+
+/* ===== 头部导航栏 ===== */
+.header-bar {
+  background: var(--bg-primary);
+  border-bottom: 1rpx solid var(--border-color);
+  padding: 24rpx;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  box-shadow: var(--shadow);
+}
+
+.header-content {
+  max-width: 1200rpx;
+  margin: 0 auto;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.main-title {
+  font-size: 36rpx;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+/* ===== 卡片样式 ===== */
+.card {
+  background: var(--bg-primary);
+  border-radius: 16rpx;
+  margin-bottom: 20rpx;
+  overflow: hidden;
+  box-shadow: var(--shadow);
+  transition: all 0.3s;
+}
+
+.card-header {
+  background: linear-gradient(135deg, var(--brand-primary) 0%, var(--brand-secondary) 100%);
+  padding: 20rpx;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.card-title {
+  font-size: 28rpx;
+  font-weight: 600;
+  color: #ffffff;
+}
+
+.card-badge {
+  background: rgba(255, 255, 255, 0.2);
+  color: #ffffff;
+  padding: 6rpx 12rpx;
+  border-radius: 20rpx;
+  font-size: 20rpx;
+  font-weight: 500;
+}
+
+.card-body {
+  padding: 20rpx;
+  display: flex;
+  flex-direction: column;
+  gap: 16rpx;
+}
+
+/* ===== 设备控制网格 ===== */
+.devices-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 12rpx;
+}
+
+.device-card-simple {
+  background: var(--bg-secondary);
+  border-radius: 12rpx;
+  padding: 16rpx;
+  display: flex;
+  flex-direction: column;
+  gap: 12rpx;
+  align-items: center;
+  text-align: center;
+  border: 1rpx solid var(--border-color);
+}
+
+.device-icon {
+  font-size: 40rpx;
+  line-height: 1;
+}
+
+.device-name {
+  font-size: 24rpx;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.device-controls {
+  display: flex;
+  gap: 8rpx;
+  width: 100%;
+}
+
+.device-btn {
+  flex: 1;
+  padding: 10rpx;
+  border: none;
+  border-radius: 8rpx;
+  font-size: 20rpx;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.3s;
+}
+
+.device-btn.on {
+  background: rgba(16, 185, 129, 0.1);
+  color: var(--success-color);
+}
+
+.device-btn.on.active {
+  background: var(--success-color);
+  color: #ffffff;
+}
+
+.device-btn.off {
+  background: rgba(239, 68, 68, 0.1);
+  color: var(--error-color);
+}
+
+.device-btn.off.active {
+  background: var(--error-color);
+  color: #ffffff;
+}
+
+.device-btn:active {
+  transform: scale(0.95);
+}
+
+.device-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ===== 接收器列表 ===== */
+.receiver-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12rpx;
+}
+
+.receiver-item {
+  background: var(--bg-secondary);
+  border-radius: 12rpx;
+  padding: 12rpx 16rpx;
+  border: 1rpx solid var(--border-color);
+  display: flex;
+  align-items: center;
+  gap: 12rpx;
+}
+
+.receiver-icon {
+  font-size: 28rpx;
+  min-width: 32rpx;
+}
+
+.receiver-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4rpx;
+}
+
+.receiver-name {
+  font-size: 24rpx;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.receiver-ip {
+  font-size: 20rpx;
+  color: var(--text-secondary);
+}
+
+.receiver-ip-input {
+  background: var(--bg-primary);
+  border: 1rpx solid var(--border-color);
+  border-radius: 6rpx;
+  padding: 6rpx 10rpx;
+  font-size: 20rpx;
+  color: var(--text-primary);
+  font-family: monospace;
+  width: 160rpx;
+}
+
+.receiver-ip-input:focus {
+  border-color: var(--brand-primary);
+  outline: none;
+}
+
+.receiver-status {
+  padding: 4rpx 10rpx;
+  border-radius: 16rpx;
+  font-size: 18rpx;
+  font-weight: 500;
+  min-width: 60rpx;
+  text-align: center;
+}
+
+.receiver-status.online {
+  background: rgba(16, 185, 129, 0.2);
+  color: var(--success-color);
+}
+
+.receiver-status.offline {
+  background: rgba(239, 68, 68, 0.2);
+  color: var(--error-color);
+}
+
+/* ===== 按钮样式 ===== */
+.btn {
+  border: none;
+  border-radius: 12rpx;
+  padding: 12rpx 24rpx;
+  font-size: 24rpx;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.3s;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.btn-primary {
+  background: linear-gradient(135deg, var(--brand-primary) 0%, var(--brand-secondary) 100%);
+  color: #ffffff;
+}
+
+.btn-primary:active {
+  opacity: 0.8;
+  transform: scale(0.98);
+}
+
+.btn-secondary {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border: 1rpx solid var(--border-color);
+}
+
+.btn-secondary:active {
+  background: var(--bg-tertiary);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.form-error {
+  font-size: 22rpx;
+  color: var(--error-color);
+  margin-top: -8rpx;
+}
+
+/* ===== 表单元素 ===== */
+.form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 12rpx;
+}
+
+.form-label {
+  font-size: 24rpx;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.input-group {
+  display: flex;
+  gap: 12rpx;
+  align-items: center;
+}
+
+.form-input {
+  flex: 1;
+  background: var(--bg-secondary);
+  border: 1rpx solid var(--border-color);
+  border-radius: 12rpx;
+  padding: 12rpx 16rpx;
+  font-size: 24rpx;
+  color: var(--text-primary);
+  transition: border-color 0.3s;
+}
+
+.form-input:focus {
+  border-color: var(--brand-primary);
+  background: var(--bg-primary);
+}
+
+.status-info {
+  margin-top: 8rpx;
+  padding: 8rpx 12rpx;
+  background: var(--bg-secondary);
+  border-radius: 6rpx;
+  font-size: 20rpx;
+  color: var(--text-secondary);
+  font-family: monospace;
+  word-break: break-all;
+}
+
+/* ===== 响应式设计 ===== */
+@media (max-width: 768px) {
+  .devices-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .receiver-item {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .receiver-status {
+    align-self: flex-start;
+  }
+}
+
+@media (max-width: 480px) {
+  .devices-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .header-content {
+    flex-direction: column;
+    gap: 12rpx;
+  }
+
+  .main-title {
+    font-size: 28rpx;
+  }
+}
+
+/* ===== 动画 ===== */
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.7;
+  }
+}
+
+/* ===== 滚动条样式 ===== */
+::-webkit-scrollbar {
+  width: 8rpx;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--bg-secondary);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-color);
+  border-radius: 4rpx;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-tertiary);
+}
+
 </style>

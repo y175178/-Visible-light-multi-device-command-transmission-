@@ -3,9 +3,9 @@
 #include <WiFi.h>
 
 const int ledPin = 16;
-const int BIT_PERIOD_MS = 10;    // 100bps
-const int FRAME_REPEAT = 2;      // 每条指令重复发送次数
-const int FRAME_GAP_MS = 12;     // 两帧之间间隔
+const int BIT_PERIOD_MS = 10; // 100bps
+const int FRAME_REPEAT = 2;   // 每条指令重复发送次数
+const int FRAME_GAP_MS = 12;  // 两帧之间间隔
 
 void wifiConnect(void);
 void serverStart(void);
@@ -13,11 +13,13 @@ void sendDataHandler(void);
 void controlHandler(void);
 void statusHandler(void);
 void applyCommand(const String &command);
+void queueCommand(const String &command);
 
 String data = "{'light':0,'temp':0,'hum':0}";
 bool lightOn = false;
 bool servoOn = false;
 bool fanOn = false;
+String pendingCommand = "";
 
 WebServer server(5000);
 
@@ -81,14 +83,23 @@ void serverStart(void)
   Serial.println("Web 服务器已启动");
 }
 
+void addCorsHeaders()
+{
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
 void sendDataHandler()
 {
   data = "{'light':1,'temp':30,'hum':60}";
+  addCorsHeaders();
   server.send(200, "text/plain", data);
 }
 
 void statusHandler(void)
 {
+  addCorsHeaders();
   String status = "{\"light\":";
   status += (lightOn ? "1" : "0");
   status += ",\"servo\":";
@@ -123,6 +134,7 @@ void applyCommand(const String &command)
 
 void controlHandler(void)
 {
+  addCorsHeaders();
   String command = server.arg("cmd");
   command.trim();
   command.toUpperCase();
@@ -141,18 +153,24 @@ void controlHandler(void)
     return;
   }
 
-  applyCommand(command);
-
   String result = "{\"ok\":true,\"cmd\":\"";
   result += command;
   result += "\",\"light\":";
-  result += (lightOn ? "1" : "0");
+  result += ((command == "LIGHT_ON") ? "1" : (command == "LIGHT_OFF" ? "0" : (lightOn ? "1" : "0")));
   result += ",\"servo\":";
-  result += (servoOn ? "1" : "0");
+  result += ((command == "SERVO_ON") ? "1" : (command == "SERVO_OFF" ? "0" : (servoOn ? "1" : "0")));
   result += ",\"fan\":";
-  result += (fanOn ? "1" : "0");
+  result += ((command == "FAN_ON") ? "1" : (command == "FAN_OFF" ? "0" : (fanOn ? "1" : "0")));
   result += "}";
   server.send(200, "application/json", result);
+
+  // 先响应HTTP，避免App在发光发送期间超时
+  queueCommand(command);
+}
+
+void queueCommand(const String &command)
+{
+  pendingCommand = command;
 }
 
 void setup()
@@ -176,6 +194,13 @@ void setup()
 void loop()
 {
   server.handleClient();
+
+  if (pendingCommand.length() > 0)
+  {
+    String commandToSend = pendingCommand;
+    pendingCommand = "";
+    applyCommand(commandToSend);
+  }
 
   if (Serial.available())
   {
