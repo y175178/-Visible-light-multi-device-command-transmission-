@@ -1,5 +1,7 @@
 第一次推送，可能有些没有顾及到的地方，欢迎大家讨论修改
 
+需要用到的环境有vscode+platform io，arduino，Hbuilder x
+
 我是供电统一5v
 接线
 发射端：
