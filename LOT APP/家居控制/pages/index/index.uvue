@@ -1,0 +1,272 @@
+<template>
+  <view class="page">
+    <view class="header">
+      <text class="title">ESP32 控制面板</text>
+      <text class="sub-title">1个发射端 + 3个接收端（灯/舵机/风扇）</text>
+    </view>
+
+    <view class="card">
+      <text class="label">发射端设置</text>
+      <view class="ip-row">
+        <input class="ip-input" v-model="txIp" placeholder="发射端IP，如 192.168.186.52" />
+        <button class="btn primary" @click="connectTx">连接</button>
+      </view>
+      <text class="status-text">连接状态：{{ txConnected ? "已连接" : "未连接" }}</text>
+      <text class="status-text">发射端消息：{{ txMessage }}</text>
+    </view>
+
+    <view class="card">
+      <text class="label">指令发送（一排）</text>
+      <view class="command-row">
+        <button class="btn command-btn" @click="toggleDevice('LIGHT')">
+          灯 {{ stateText(deviceStatus.light) }}
+        </button>
+        <button class="btn command-btn" @click="toggleDevice('SERVO')">
+          舵机 {{ stateText(deviceStatus.servo) }}
+        </button>
+        <button class="btn command-btn" @click="toggleDevice('FAN')">
+          风扇 {{ stateText(deviceStatus.fan) }}
+        </button>
+      </view>
+    </view>
+
+    <view class="card">
+      <text class="label">接收端确认状态</text>
+      <view class="receiver-row" v-for="(rx, index) in receivers" :key="rx.id">
+        <view class="receiver-top">
+          <text class="receiver-name">{{ rx.name }}</text>
+          <text class="receiver-state">{{ rx.message }}</text>
+        </view>
+        <input class="ip-input single" v-model="rx.ip" :placeholder="rx.placeholder" />
+        <text class="status-text">最近确认：{{ rx.lastCommand }}</text>
+      </view>
+    </view>
+
+    <view class="card">
+      <text class="label">环境信息</text>
+      <view class="info-row">
+        <text class="info-item">光照 {{ sensorData.light }}</text>
+        <text class="info-item">温度 {{ sensorData.temp }}°C</text>
+        <text class="info-item">湿度 {{ sensorData.hum }}%</text>
+      </view>
+    </view>
+  </view>
+</template>
+
+<script setup lang="uts">
+import { onMounted, onUnmounted, reactive, ref } from "vue";
+
+const timer = ref<number | null>(null);
+const txIp = ref("192.168.186.52");
+const txConnected = ref(false);
+const txMessage = ref("未连接");
+
+const deviceStatus = reactive({
+  light: 0,
+  servo: 0,
+  fan: 0
+});
+
+const sensorData = reactive({
+  light: 0,
+  temp: 0,
+  hum: 0
+});
+
+const receivers = ref([
+  { id: 1, name: "接收端1（灯）", device: "LIGHT", ip: "", placeholder: "灯接收端IP", lastCommand: "无", message: "未确认" },
+  { id: 2, name: "接收端2（舵机）", device: "SERVO", ip: "", placeholder: "舵机接收端IP", lastCommand: "无", message: "未确认" },
+  { id: 3, name: "接收端3（风扇）", device: "FAN", ip: "", placeholder: "风扇接收端IP", lastCommand: "无", message: "未确认" }
+]);
+
+function parseResponseData(raw: any): any {
+  if (typeof raw === "string") {
+    const normalized = raw.replace(/'/g, "\"");
+    try {
+      return JSON.parse(normalized);
+    } catch (e) {
+      return {};
+    }
+  }
+  return raw ?? {};
+}
+
+function normalizeHost(host: string, defaultPort: string): string {
+  let h = host.trim();
+  if (h.startsWith("http://")) h = h.substring(7);
+  else if (h.startsWith("https://")) h = h.substring(8);
+  if (h.length > 0 && !h.includes(":")) h = h + ":" + defaultPort;
+  return h;
+}
+
+function txBase(): string {
+  return "http://" + normalizeHost(txIp.value, "5000");
+}
+
+function rxBase(ip: string): string {
+  return "http://" + normalizeHost(ip, "80");
+}
+
+function stateText(v: number): string {
+  return v === 1 ? "开" : "关";
+}
+
+function connectTx(): void {
+  const host = normalizeHost(txIp.value, "5000");
+  if (host.length === 0) {
+    uni.showToast({ title: "请输入发射端IP", icon: "none" });
+    return;
+  }
+  txIp.value = host;
+  txConnected.value = true;
+  txMessage.value = "已连接";
+  uni.showToast({ title: "发射端连接成功", icon: "none" });
+  syncTx();
+  syncAllReceivers();
+}
+
+function syncTx(): void {
+  if (!txConnected.value) return;
+
+  uni.request({
+    method: "GET",
+    url: txBase() + "/data",
+    success: (res: any) => {
+      const data = parseResponseData(res.data);
+      sensorData.light = Number(data.light ?? 0);
+      sensorData.temp = Number(data.temp ?? 0);
+      sensorData.hum = Number(data.hum ?? 0);
+      txMessage.value = "在线";
+    },
+    fail: () => {
+      txMessage.value = "发射端离线";
+    }
+  });
+}
+
+function setDeviceStateByReceiver(device: string, val: number): void {
+  if (device === "LIGHT") deviceStatus.light = val;
+  if (device === "SERVO") deviceStatus.servo = val;
+  if (device === "FAN") deviceStatus.fan = val;
+}
+
+function syncReceiverAck(rxIndex: number): void {
+  const rx = receivers.value[rxIndex];
+  if (rx.ip.trim().length === 0) return;
+
+  uni.request({
+    method: "GET",
+    url: rxBase(rx.ip) + "/ack",
+    success: (res: any) => {
+      const data = parseResponseData(res.data);
+      const ackCmd = String(data.lastCmd ?? "");
+      const state = Number(data.state ?? -1);
+      if (state === 0 || state === 1) {
+        setDeviceStateByReceiver(rx.device, state);
+      }
+      if (ackCmd.length > 0) rx.lastCommand = ackCmd;
+    }
+  });
+}
+
+function syncAllReceivers(): void {
+  receivers.value.forEach((_, index) => syncReceiverAck(index));
+}
+
+function toggleDevice(device: string): void {
+  if (!txConnected.value) {
+    uni.showToast({ title: "请先连接发射端", icon: "none" });
+    return;
+  }
+
+  let current = 0;
+  if (device === "LIGHT") current = deviceStatus.light;
+  if (device === "SERVO") current = deviceStatus.servo;
+  if (device === "FAN") current = deviceStatus.fan;
+  const cmd = current === 1 ? device + "_OFF" : device + "_ON";
+
+  const rxIndex = receivers.value.findIndex((x) => x.device === device);
+  if (rxIndex >= 0) {
+    receivers.value[rxIndex].message = "等待ACK...";
+    receivers.value[rxIndex].lastCommand = cmd;
+  }
+
+  uni.request({
+    method: "GET",
+    url: txBase() + "/control?cmd=" + cmd,
+    success: () => {
+      uni.vibrateShort();
+      if (rxIndex >= 0) waitAck(rxIndex, cmd, 0);
+    },
+    fail: () => {
+      txMessage.value = "发射失败";
+      uni.showToast({ title: "发送失败", icon: "none" });
+    }
+  });
+}
+
+function waitAck(rxIndex: number, cmd: string, retry: number): void {
+  const maxRetry = 8;
+  const rx = receivers.value[rxIndex];
+
+  if (rx.ip.trim().length === 0) {
+    rx.message = "未填接收端IP";
+    return;
+  }
+
+  uni.request({
+    method: "GET",
+    url: rxBase(rx.ip) + "/ack",
+    success: (res: any) => {
+      const data = parseResponseData(res.data);
+      const ackCmd = String(data.lastCmd ?? "");
+      if (ackCmd === cmd) {
+        rx.message = "确认成功";
+        setDeviceStateByReceiver(rx.device, Number(data.state ?? 0));
+        syncTx();
+        return;
+      }
+      if (retry < maxRetry) setTimeout(() => waitAck(rxIndex, cmd, retry + 1), 600);
+      else rx.message = "确认超时";
+    },
+    fail: () => {
+      if (retry < maxRetry) setTimeout(() => waitAck(rxIndex, cmd, retry + 1), 600);
+      else rx.message = "ACK失败";
+    }
+  });
+}
+
+onMounted(() => {
+  timer.value = setInterval(() => {
+    if (txConnected.value) syncTx();
+    syncAllReceivers();
+  }, 5000);
+});
+
+onUnmounted(() => {
+  if (timer.value !== null) clearInterval(timer.value);
+});
+</script>
+
+<style>
+.page { min-height: 100vh; background-color: #f4f6fb; padding: 24rpx; }
+.header { margin-bottom: 20rpx; }
+.title { font-size: 40rpx; font-weight: 600; color: #1f2937; }
+.sub-title { margin-top: 8rpx; font-size: 25rpx; color: #6b7280; }
+.card { background: #fff; border-radius: 16rpx; padding: 20rpx; margin-bottom: 16rpx; }
+.label { font-size: 28rpx; color: #111827; font-weight: 500; }
+.ip-row { display: flex; align-items: center; margin-top: 12rpx; }
+.ip-input { flex: 1; background: #f3f4f6; border-radius: 12rpx; padding: 14rpx; margin-right: 8rpx; }
+.ip-input.single { margin-top: 8rpx; margin-right: 0; }
+.status-text { margin-top: 8rpx; color: #6b7280; font-size: 24rpx; }
+.btn { border: 0; border-radius: 12rpx; padding: 8rpx 20rpx; background-color: #e5e7eb; color: #111827; font-size: 24rpx; }
+.btn.primary { background-color: #2563eb; color: #fff; }
+.command-row { display: flex; justify-content: space-between; margin-top: 14rpx; }
+.command-btn { width: 31%; background-color: #eef2ff; color: #3730a3; }
+.receiver-row { margin-top: 14rpx; padding: 12rpx; border-radius: 12rpx; background: #f9fafb; }
+.receiver-top { display: flex; justify-content: space-between; align-items: center; }
+.receiver-name { font-size: 26rpx; color: #111827; }
+.receiver-state { font-size: 24rpx; color: #4b5563; }
+.info-row { display: flex; justify-content: space-between; margin-top: 12rpx; }
+.info-item { width: 32%; text-align: center; padding: 14rpx 8rpx; background: #f9fafb; border-radius: 12rpx; color: #374151; font-size: 24rpx; }
+</style>
