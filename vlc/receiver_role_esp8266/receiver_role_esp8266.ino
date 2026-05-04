@@ -7,12 +7,14 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 
-const int adcPin = A0;           // NodeMCU 仅有一个 ADC 引脚
-const int outPin = D1;           // NodeMCU D1 作为继电器/驱动输出，可按接线更改
-const int BIT_PERIOD_MS = 10;    // 与发射端保持一致(100bps)
-const int SAMPLE_COUNT = 5;      // 每bit采样次数
-const int SAMPLE_DELAY_MS = 1;   // 单次采样间隔
-const int SAMPLE_HIGH_COUNT = 3; // 判定为1的最小高电平次数
+const int signalPin = A0;         // 改为A0模拟输入
+const int outPin = D1;            // NodeMCU D1 作为继电器/驱动输出，可按接线更改
+const int BIT_PERIOD_US = 1000;   // 改为1kbps (1000us = 1kbps)
+const int SAMPLE_COUNT = 50;      // 采样次数
+const int SAMPLE_DELAY_US = 4;    // 采样间隔
+const int SAMPLE_HIGH_COUNT = 25; // 需要50%采样 > 阈值
+const int D2_SAMPLE_PERIOD_US = 10; // d2连续打印间隔
+int adcThreshold = 13; // 默认阈值
 
 // 1=LIGHT, 2=SERVO, 3=FAN
 const int DEVICE_ROLE = 1;
@@ -22,51 +24,60 @@ const char *password = "1751787761";
 
 ESP8266WebServer server(80);
 
-int threshold = 2;
 bool deviceOn = false;
 String lastCommand = "";
 String receivedData = "等待接收数据...";
 unsigned long lastAckMs = 0;
-bool debugAdc = false;
+bool debugSignal = false;
+bool continuousDebug = false;
 
-void autoCalibrateThreshold()
+// WiFi上传相关
+bool wifiUploadPending = false;
+bool wifiUploading = false;
+bool hasReceivedFirstCommand = false;
+bool webServerStarted = false;
+const char *txHost = "192.168.54.52";  // 发射端IP
+const int txPort = 5000;               // 发射端端口
+unsigned long lastUploadTime = 0;
+const unsigned long UPLOAD_COOLDOWN = 100;  // 100ms冷却时间
+const unsigned long ACK_WINDOW_MS = 3000;   // 上传后保留ACK窗口，供网页读取/ack
+
+void autoCheckSignalPin()
 {
-  int minV = 1024;
-  int maxV = 0;
-  for (int i = 0; i < 400; i++)
+  Serial.println("\n========== 开始 A0 输入检查 ==========");
+  Serial.println("第1步：检查 A0 模拟输入状态...");
+  delay(2000);
+
+  const int sampleCount = 100;
+  int minVal = 1023;
+  int maxVal = 0;
+  int sum = 0;
+  for (int i = 0; i < sampleCount; i++)
   {
-    int v = analogRead(adcPin);
-    if (v < minV)
-      minV = v;
-    if (v > maxV)
-      maxV = v;
-    delay(2);
+    int val = analogRead(signalPin);
+    minVal = min(minVal, val);
+    maxVal = max(maxVal, val);
+    sum += val;
+    delay(10);
   }
-  int range = maxV - minV;
-  if (range < 15)
+  int avgVal = sum / sampleCount;
+
+  Serial.print("A0 输入采样结果: 最小=");
+  Serial.print(minVal);
+  Serial.print(" 平均=");
+  Serial.print(avgVal);
+  Serial.print(" 最大=");
+  Serial.println(maxVal);
+
+  if (maxVal - minVal < 50)
   {
-    // 动态范围太小，说明光信号变化不足，给一个保守阈值并提示用户
-    threshold = minV + 8;
-    if (threshold < 5)
-      threshold = 5;
-    if (threshold > 900)
-      threshold = 900;
-    Serial.println("warning: 光信号变化太小，请缩短距离/对准发射灯/降低环境光");
+    Serial.println("⚠️ A0 值变化太小，请检查 LM358 输出、反馈电阻和接线");
   }
   else
   {
-    // 偏向高电平一侧，降低噪声误判为1
-    threshold = minV + (range * 65) / 100;
+    Serial.println("✅ A0 存在足够变化，输入信号正常");
   }
-  Serial.print("auto threshold=");
-  Serial.print(threshold);
-  Serial.print(" (min=");
-  Serial.print(minV);
-  Serial.print(", max=");
-  Serial.print(maxV);
-  Serial.print(", range=");
-  Serial.print(range);
-  Serial.println(")");
+  Serial.println("========== 校准完成 ==========\n");
 }
 
 enum RxState
@@ -115,6 +126,10 @@ void applyCommand(const String &cmd)
 
   Serial.print("执行指令: ");
   Serial.println(cmd);
+
+  // 首次收到有效指令后，才允许WiFi相关动作，避免上电阶段干扰A0接收
+  hasReceivedFirstCommand = true;
+  wifiUploadPending = true;
 }
 
 void resetRx()
@@ -169,9 +184,7 @@ void handleAck()
   sendCorsHeaders();
   String json = "{\"ok\":true,\"device\":\"";
   json += roleName();
-  json += "\",\"connected\":";
-  json += (WiFi.status() == WL_CONNECTED ? "true" : "false");
-  json += ",\"state\":";
+  json += "\",\"state\":";
   json += (deviceOn ? "1" : "0");
   json += ",\"lastCmd\":\"";
   json += lastCommand;
@@ -184,102 +197,310 @@ void handleAck()
 void handleRoot()
 {
   sendCorsHeaders();
-  String html = "<html><head><meta charset='utf-8'><meta http-equiv='refresh' content='1'></head><body style='text-align:center;margin-top:40px'>";
+  String html = "<html><head><meta charset='utf-8'></head><body style='text-align:center;margin-top:40px'>";
   html += "<h2>VLC接收端</h2>";
   html += "<h3>ROLE: " + roleName() + "</h3>";
-  html += "<h3>WIFI: " + String(WiFi.status() == WL_CONNECTED ? "连接成功" : "未连接") + "</h3>";
-  html += "<h3>THRESHOLD: " + String(threshold) + "</h3>";
-  html += "<h3>LAST: " + receivedData + "</h3>";
   html += "<h3>STATE: " + String(deviceOn ? "ON" : "OFF") + "</h3>";
+  html += "<h3>LAST: " + receivedData + "</h3>";
   html += "</body></html>";
   server.send(200, "text/html", html);
+}
+
+void serverStart()
+{
+  server.on("/", handleRoot);
+  server.on("/ack", handleAck);
+  server.begin();
+  Serial.println("接收端Web服务器已启动 (端口80)");
+}
+
+void uploadStateToTx()
+{
+  if (!hasReceivedFirstCommand) return;
+  if (wifiUploading) return;  // 防止重复上传
+  if ((millis() - lastUploadTime) < UPLOAD_COOLDOWN) return;  // 冷却时间检查
+  
+  wifiUploading = true;
+  lastUploadTime = millis();
+  
+  Serial.println("[WiFi] 启动上传...");
+  
+  // 唤醒WiFi并上传数据
+  WiFi.forceSleepWake();
+  delay(50);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(ssid, password);
+
+  // 快速连接，最多等待20秒
+  unsigned long startTime = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - startTime) < 20000)
+  {
+    delay(100);
+  }
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.println("[WiFi] 已连接");
+    if (!webServerStarted)
+    {
+      serverStart();
+      webServerStarted = true;
+    }
+
+    // 上传状态到网页
+    WiFiClient client;
+    if (client.connect(txHost, txPort))
+    {
+      String path = "/upload?device=" + roleName() + "&state=" + (deviceOn ? "1" : "0");
+      Serial.print("[WiFi] 上报请求: http://");
+      Serial.print(txHost);
+      Serial.print(":");
+      Serial.print(txPort);
+      Serial.println(path);
+      client.print("GET " + path + " HTTP/1.1\r\n");
+      client.print("Host: ");
+      client.print(txHost);
+      client.print(":" + String(txPort) + "\r\n");
+      client.print("Connection: close\r\n\r\n");
+      
+      // 等待并读取响应
+      delay(500);
+      String response = "";
+      while (client.available())
+      {
+        char c = client.read();
+        response += c;
+      }
+      
+      if (response.length() > 0 && response.indexOf("ok") >= 0)
+      {
+        Serial.println("[WiFi] 状态已成功上报到发射端");
+        Serial.print("[WiFi] 响应摘要: ");
+        int bodyPos = response.indexOf("\r\n\r\n");
+        if (bodyPos >= 0)
+          Serial.println(response.substring(bodyPos + 4));
+        else
+          Serial.println(response);
+
+        // 上传完成后保留一段时间的ACK窗口，确保网页有机会拉到最新状态
+        Serial.print("[WiFi] 保持在线等待网页读取ACK: ");
+        Serial.print(ACK_WINDOW_MS);
+        Serial.println("ms");
+        unsigned long ackStart = millis();
+        while (millis() - ackStart < ACK_WINDOW_MS)
+        {
+          server.handleClient();
+          delay(5);
+        }
+      }
+      else
+      {
+        Serial.println("[WiFi] 上报状态但未收到确认");
+        Serial.print("[WiFi] 响应: ");
+        Serial.println(response);
+      }
+      client.stop();
+    }
+    else
+    {
+      Serial.println("[WiFi] 无法连接到发射端: " + String(txHost) + ":" + String(txPort));
+    }
+  }
+  else
+  {
+    Serial.println("[WiFi] 连接SSID失败");
+  }
+
+  // 关闭WiFi
+  WiFi.mode(WIFI_OFF);
+  WiFi.forceSleepBegin();
+  Serial.println("[WiFi] 已关闭");
+  wifiUploading = false;
+}
+
+// 确保WiFi在接收数据前完全关闭
+void ensureWiFiOff() {
+  WiFi.mode(WIFI_OFF);
+  WiFi.forceSleepBegin();
+  delay(50);
+  Serial.println("[WiFi] 已关闭");
+}
+
+void setThreshold() {
+  Serial.println("请输入新的阈值（0-1023）：");
+  while (!Serial.available()) {
+    delay(100);
+  }
+  String input = Serial.readStringUntil('\n');
+  int newThreshold = input.toInt();
+  if (newThreshold >= 0 && newThreshold <= 1023) {
+    adcThreshold = newThreshold;
+    Serial.print("新的阈值已设置为：");
+    Serial.println(adcThreshold);
+  } else {
+    Serial.println("输入无效，保持原阈值。");
+  }
+}
+
+bool sampleHalfBitAtCenter()
+{
+  const int halfPeriodUs = BIT_PERIOD_US / 2;
+  const int sampleWindowUs = (SAMPLE_COUNT - 1) * SAMPLE_DELAY_US;
+  int preDelayUs = (halfPeriodUs / 2) - (sampleWindowUs / 2);
+  if (preDelayUs < 0)
+    preDelayUs = 0;
+
+  if (preDelayUs > 0)
+    delayMicroseconds(preDelayUs);
+
+  int highCount = 0;
+  for (int i = 0; i < SAMPLE_COUNT; i++)
+  {
+    if (analogRead(signalPin) > adcThreshold)
+      highCount++;
+    if (i < SAMPLE_COUNT - 1)
+      delayMicroseconds(SAMPLE_DELAY_US);
+  }
+
+  int postDelayUs = halfPeriodUs - preDelayUs - sampleWindowUs;
+  if (postDelayUs > 0)
+    delayMicroseconds(postDelayUs);
+
+  return highCount >= SAMPLE_HIGH_COUNT;
 }
 
 void setup()
 {
   Serial.begin(9600);
   delay(100);
-  pinMode(adcPin, INPUT);
   pinMode(outPin, OUTPUT);
   digitalWrite(outPin, LOW);
 
-  WiFi.begin(ssid, password);
-  WiFi.setSleepMode(WIFI_NONE_SLEEP); // WiFi常开，减小采样抖动
-  while (WiFi.status() != WL_CONNECTED)
-  {
-    delay(500);
-  }
+  ensureWiFiOff(); // 确保WiFi关闭
 
-  server.on("/", handleRoot);
-  server.on("/ack", handleAck);
-  server.begin();
-
-  Serial.println("接收端启动");
+  delay(500);
+  Serial.println("接收端启动 (WiFi待命模式，A0模拟输入模式)");
   Serial.print("ROLE = ");
   Serial.println(roleName());
-  Serial.print("IP = ");
-  Serial.println(WiFi.localIP());
-  Serial.println("开始自动阈值校准...");
-  autoCalibrateThreshold();
+  Serial.println("观察模式：A0 模拟输入，位速率1kbps");
+  Serial.println("开始信号输入检查...");
+  autoCheckSignalPin();
+
+  setThreshold(); // 手动设置阈值
 }
 
 void loop()
 {
-  server.handleClient();
+  // WiFi在线时持续处理HTTP请求，便于网页轮询/ack
+  if (webServerStarted && WiFi.status() == WL_CONNECTED)
+  {
+    server.handleClient();
+  }
+
+  // 检查是否需要上传状态（在不影响信号接收的时候执行）
+  if (hasReceivedFirstCommand && wifiUploadPending && !wifiUploading)
+  {
+    wifiUploadPending = false;
+    // 异步执行上传，不阻塞主loop
+    uploadStateToTx();
+  }
 
   if (Serial.available())
   {
     String s = Serial.readStringUntil('\n');
     s.trim();
-    if (s.startsWith("t "))
+    if (s == "d1")
     {
-      threshold = s.substring(2).toInt();
-      Serial.print("threshold=");
-      Serial.println(threshold);
+      debugSignal = true;
+      continuousDebug = false;
+      Serial.println("✓ A0 信号调试已开启 (每300ms打印一次)");
     }
-    else if (s == "d1")
+    else if (s == "d2")
     {
-      debugAdc = true;
-      Serial.println("ADC调试已开启");
+      debugSignal = true;
+      continuousDebug = true;
+      Serial.println("✓ A0 连续打印已开启 (每10us打印一次)");
     }
     else if (s == "d0")
     {
-      debugAdc = false;
-      Serial.println("ADC调试已关闭");
+      debugSignal = false;
+      continuousDebug = false;
+      Serial.println("✓ A0 信号调试已关闭");
     }
-    else if (s == "auto")
+    else if (s == "auto" || s == "check")
     {
-      autoCalibrateThreshold();
+      autoCheckSignalPin();
+    }
+    else if (s == "info")
+    {
+      Serial.println("\n========== 诊断信息 ==========");
+      Serial.print("当前 A0 输入: ");
+      Serial.println(analogRead(signalPin));
+      Serial.print("设备状态: ");
+      Serial.println(deviceOn ? "ON" : "OFF");
+      Serial.print("上次命令: ");
+      Serial.println(lastCommand);
+      Serial.println("========== 快速测试 ==========");
+      Serial.println("输入命令:");
+      Serial.println("  d1          - 开启A0信号调试（每300ms打印一次）");
+      Serial.println("  d2          - 开启A0连续打印（每10us打印一次，观测LM358输出）");
+      Serial.println("  d0          - 关闭A0信号监控");
+      Serial.println("  auto 或 check - 检查A0模拟输入状态");
+      Serial.println("  info        - 显示本菜单");
+      Serial.println("=========================================");
+    }
+    else
+    {
+      Serial.println("\n未知命令。输入 'info' 获取帮助\n");
     }
   }
 
-  if (debugAdc)
+  if (debugSignal)
   {
-    static unsigned long lastDbg = 0;
-    if (millis() - lastDbg >= 300)
+    if (continuousDebug)
     {
-      lastDbg = millis();
-      int adc = analogRead(adcPin);
-      Serial.print("ADC=");
-      Serial.print(adc);
-      Serial.print(" threshold=");
-      Serial.println(threshold);
+      static unsigned long lastPrintUs = 0;
+      unsigned long nowUs = micros();
+      if (nowUs - lastPrintUs >= D2_SAMPLE_PERIOD_US)
+      {
+        lastPrintUs = nowUs;
+        Serial.println(analogRead(signalPin));
+      }
+    }
+    else
+    {
+      static unsigned long lastDbg = 0;
+      if (millis() - lastDbg >= 300)
+      {
+        lastDbg = millis();
+        int val = analogRead(signalPin);
+        Serial.print("A0=");
+        Serial.print(val);
+        Serial.print(" | state=");
+        Serial.println(deviceOn ? "ON" : "OFF");
+      }
     }
   }
 
+  // 使用micros()实现高精度1000us周期
   static unsigned long lastSample = 0;
-  if (millis() - lastSample < BIT_PERIOD_MS)
+  unsigned long now = micros();
+  if (now - lastSample < BIT_PERIOD_US)
     return;
-  lastSample = millis();
+  lastSample = now;
 
-  int onCount = 0;
-  for (int i = 0; i < SAMPLE_COUNT; i++)
-  {
-    if (analogRead(adcPin) > threshold)
-      onCount++;
-    delay(SAMPLE_DELAY_MS);
-  }
-  bool bit = (onCount >= SAMPLE_HIGH_COUNT);
+  // 曼切斯特解码：每个半周期在中点附近进行50次集中采样
+  bool half1High = sampleHalfBitAtCenter();
+  bool half2High = sampleHalfBitAtCenter();
+
+  bool bit;
+  if (half1High && !half2High)
+    bit = 1; // 高→低 = 1
+  else if (!half1High && half2High)
+    bit = 0; // 低→高 = 0
+  else
+    bit = 0; // 其他情况，默认为0
 
   if (rxState == WAIT_PREAMBLE)
   {

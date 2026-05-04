@@ -1,4 +1,4 @@
-<template>
+﻿<template>
   <view class="page">
     <!-- 顶部导航栏 -->
     <view class="header-bar">
@@ -85,8 +85,8 @@
                   <text class="receiver-name">{{ rx.name }}</text>
                   <input class="receiver-ip-input" v-model="rx.ip" placeholder="192.168.1.101" @blur="saveReceivers" />
                 </view>
-                <view class="receiver-status" :class="rx.connected ? 'online' : 'offline'">
-                  {{ rx.connected ? "在线" : "离线" }}
+                <view class="receiver-status" :class="rx.state === 1 ? 'on' : 'off'">
+                  {{ rx.state === 1 ? "✓ ON" : "✗ OFF" }}
                 </view>
               </view>
             </view>
@@ -130,10 +130,25 @@ const stats = reactive({
 });
 
 // 接收端配置
-const receivers = ref<Array<{ id: number; name: string; device: string; ip: string; message: string; connected: boolean }>>([
-  { id: 1, name: "灯", device: "LIGHT", ip: "", message: "未配置IP", connected: false },
-  { id: 2, name: "舵机", device: "SERVO", ip: "", message: "未配置IP", connected: false }
+const receivers = ref<Array<{ id: number; name: string; device: string; ip: string; message: string; connected: boolean; state: number }>>([
+  { id: 1, name: "灯", device: "LIGHT", ip: "", message: "未配置IP", connected: false, state: 0 },
+  { id: 2, name: "舵机", device: "SERVO", ip: "", message: "未配置IP", connected: false, state: 0 }
 ]);
+
+function saveStateCache(): void {
+  try {
+    uni.setStorageSync("deviceStatusCache", JSON.stringify({
+      light: deviceStatus.light,
+      servo: deviceStatus.servo,
+      fan: deviceStatus.fan
+    }));
+    uni.setStorageSync("receiverStateCache", JSON.stringify(
+      receivers.value.map((rx) => ({ device: rx.device, state: rx.state }))
+    ));
+  } catch (e) {
+    addLog("保存状态缓存失败", "error");
+  }
+}
 
 // 本地存储管理
 function loadSettings(): void {
@@ -150,6 +165,25 @@ function loadSettings(): void {
       receivers.value.forEach((rx, index) => {
         if (parsed[index] && parsed[index].ip) {
           rx.ip = parsed[index].ip;
+        }
+      });
+    }
+
+    const savedStatus = uni.getStorageSync("deviceStatusCache");
+    if (savedStatus) {
+      const parsedStatus = JSON.parse(savedStatus);
+      deviceStatus.light = Number(parsedStatus.light ?? deviceStatus.light) === 1 ? 1 : 0;
+      deviceStatus.servo = Number(parsedStatus.servo ?? deviceStatus.servo) === 1 ? 1 : 0;
+      deviceStatus.fan = Number(parsedStatus.fan ?? deviceStatus.fan) === 1 ? 1 : 0;
+    }
+
+    const savedReceiverState = uni.getStorageSync("receiverStateCache");
+    if (savedReceiverState) {
+      const parsedReceiverState = JSON.parse(savedReceiverState);
+      receivers.value.forEach((rx) => {
+        const matched = parsedReceiverState.find((x: any) => x.device === rx.device);
+        if (matched) {
+          rx.state = Number(matched.state ?? rx.state) === 1 ? 1 : 0;
         }
       });
     }
@@ -313,7 +347,7 @@ function testConnection(): void {
   if (txIp.value.trim()) {
     uni.request({
       method: "GET",
-      url: txBase() + "/data",
+      url: txBase() + "/status",
       timeout: 5000,
       success: (res: any) => {
         addLog(`发射端连接成功: ${JSON.stringify(res)}`, "success");
@@ -367,7 +401,7 @@ function connectTx(): void {
 
   uni.request({
     method: "GET",
-    url: txBase() + "/data",
+    url: txBase() + "/status",
     timeout: 3000,
     success: (res: any) => {
       addLog(`发射端响应: ${JSON.stringify(res.data)}`, "info");
@@ -395,14 +429,24 @@ function connectTx(): void {
 }
 
 function syncTx(): void {
-  if (!txConnected.value) return;
+  if (!txIp.value.trim()) return;
 
   uni.request({
     method: "GET",
-    url: txBase() + "/data",
+    url: txBase() + "/status",
     timeout: 2000,
     success: (res: any) => {
       const data = parseResponseData(res.data);
+      const light = Number(data.light ?? deviceStatus.light);
+      const servo = Number(data.servo ?? deviceStatus.servo);
+      const fan = Number(data.fan ?? deviceStatus.fan);
+
+      deviceStatus.light = light === 1 ? 1 : 0;
+      deviceStatus.servo = servo === 1 ? 1 : 0;
+      deviceStatus.fan = fan === 1 ? 1 : 0;
+      saveStateCache();
+
+      txConnected.value = true;
       txMessage.value = "在线";
       updateStats(true);
     },
@@ -419,6 +463,7 @@ function syncReceiverAck(rxIndex: number): void {
   if (rx.ip.trim().length === 0) {
     rx.connected = false;
     rx.message = "未填IP";
+    rx.state = 0;
     return;
   }
 
@@ -433,7 +478,9 @@ function syncReceiverAck(rxIndex: number): void {
       
       rx.connected = true;
       if (state === 0 || state === 1) {
+        rx.state = state;
         setDeviceStateByReceiver(rx.device, state);
+        saveStateCache();
       }
       rx.message = "在线";
       
@@ -443,6 +490,7 @@ function syncReceiverAck(rxIndex: number): void {
       addLog(`接收端 ${rx.name} 连接失败: ${rx.ip}/ack`, "error");
       rx.connected = false;
       rx.message = "离线";
+      // 网络异常时保留上一次状态，不在页面清零
       updateStats(false);
     }
   });
@@ -482,19 +530,20 @@ function setDeviceState(device: string, state: number): void {
   uni.request({
     method: "GET",
     url: txBase() + "/control?cmd=" + cmd,
-    timeout: 6000,
+    timeout: 2000,  // 缩短到2秒
     success: () => {
       uni.vibrateShort();
       addLog(`${cmd} 成功`, "success");
       
+      // 立即允许下一次点击，后台继续等待确认
+      commandSending.value = false;
+      updateStats(true);
+      
+      // 异步等待接收端确认，不阻塞UI
       const rxIndex = receivers.value.findIndex((x) => x.device === device);
       if (rxIndex >= 0) {
         waitAck(rxIndex, cmd, 0);
-      } else {
-        commandSending.value = false;
       }
-      
-      updateStats(true);
     },
     fail: (err: any) => {
       commandSending.value = false;
@@ -506,19 +555,18 @@ function setDeviceState(device: string, state: number): void {
 }
 
 function waitAck(rxIndex: number, cmd: string, retry: number): void {
-  const maxRetry = 6;
+  const maxRetry = 2;  // 只重试2次
   const rx = receivers.value[rxIndex];
 
   if (rx.ip.trim().length === 0) {
     rx.message = "未填IP";
-    commandSending.value = false;
     return;
   }
 
   uni.request({
     method: "GET",
     url: rxBase(rx.ip) + "/ack",
-    timeout: 2000,
+    timeout: 800,  // 缩短到800ms
     success: (res: any) => {
       const data = parseResponseData(res.data);
       const ackCmd = String(data.lastCmd ?? "");
@@ -526,55 +574,46 @@ function waitAck(rxIndex: number, cmd: string, retry: number): void {
       rx.connected = true;
       
       if (ackCmd === cmd) {
+        const state = Number(data.state ?? 0);
         rx.message = "✓";
-        setDeviceStateByReceiver(rx.device, Number(data.state ?? 0));
-        commandSending.value = false;
+        rx.state = state;
+        setDeviceStateByReceiver(rx.device, state);
+        saveStateCache();
         
-        // 临时显示成功状态，2秒后恢复
+        // 临时显示成功状态，500ms后恢复
         setTimeout(() => {
           if (rx.message === "✓") {
             rx.message = "在线";
           }
-        }, 2000);
+        }, 500);
         
         syncTx();
-        updateStats(true);
         return;
       }
 
       if (retry < maxRetry) {
-        setTimeout(() => waitAck(rxIndex, cmd, retry + 1), 500);
+        setTimeout(() => waitAck(rxIndex, cmd, retry + 1), 100);  // 100ms重试
       } else {
         rx.message = "✗";
-        commandSending.value = false;
-        
-        // 临时显示失败状态，2秒后恢复
         setTimeout(() => {
           if (rx.message === "✗") {
             rx.message = "在线";
           }
-        }, 2000);
-        
-        addLog(`${cmd} 确认超时`, "warn");
-        updateStats(false);
+        }, 500);
       }
     },
     fail: () => {
       if (retry < maxRetry) {
-        setTimeout(() => waitAck(rxIndex, cmd, retry + 1), 500);
+        setTimeout(() => waitAck(rxIndex, cmd, retry + 1), 100);
       } else {
         rx.connected = false;
         rx.message = "✗";
-        commandSending.value = false;
-        
+        // 网络异常时保留上一次状态，不在页面清零
         setTimeout(() => {
           if (rx.message === "✗") {
             rx.message = "离线";
           }
-        }, 2000);
-        
-        addLog(`${cmd} 确认失败`, "error");
-        updateStats(false);
+        }, 500);
       }
     }
   });
@@ -840,6 +879,16 @@ onUnmounted(() => {
 }
 
 .receiver-status.offline {
+  background: rgba(239, 68, 68, 0.2);
+  color: var(--error-color);
+}
+
+.receiver-status.on {
+  background: rgba(16, 185, 129, 0.2);
+  color: var(--success-color);
+}
+
+.receiver-status.off {
   background: rgba(239, 68, 68, 0.2);
   color: var(--error-color);
 }
