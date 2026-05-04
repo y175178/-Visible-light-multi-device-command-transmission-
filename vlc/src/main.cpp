@@ -7,6 +7,35 @@ const int BIT_PERIOD_US = 1000; // 1000us = 1kbps
 const int FRAME_REPEAT = 2;     // 每条指令重复发送次数
 const int FRAME_GAP_MS = 12;    // 两帧之间间隔
 
+// ===== 定长3bit短码码表 =====
+struct ShortEntry {
+  const char* cmd;
+  uint8_t     code;  // 1~6
+};
+
+const ShortEntry SHORT_TABLE[] = {
+  { "LIGHT_ON",  1 },
+  { "LIGHT_OFF", 2 },
+  { "SERVO_ON",  3 },
+  { "SERVO_OFF", 4 },
+  { "FAN_ON",    5 },
+  { "FAN_OFF",   6 },
+};
+const int SHORT_TABLE_SIZE = 6;
+// ===== 新增：CRC-8 计算（多项式 0x07）=====
+uint8_t crc8(uint8_t *data, uint8_t len) {
+  uint8_t crc = 0x00;
+  for (uint8_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (uint8_t j = 0; j < 8; j++) {
+      if (crc & 0x80)
+        crc = (crc << 1) ^ 0x07;
+      else
+        crc <<= 1;
+    }
+  }
+  return crc;
+}
 
 void wifiConnect(void);
 void serverStart(void);
@@ -57,18 +86,43 @@ void sendByte(uint8_t b)
     sendBit((b >> i) & 1);
 }
 
-void sendMessage(const String &msg)
-{
-  for (int n = 0; n < FRAME_REPEAT; n++)
-  {
-    // 前导码
-    for (int i = 0; i < 25; i++)
-      sendBit(1);
+// ===== 发送霍夫曼编码帧 =====
+// ===== 发送短码帧（含CRC）=====
+void sendShortMessage(const String &cmd) {
+  int idx = -1;
+  for (int i = 0; i < SHORT_TABLE_SIZE; i++) {
+    if (cmd == SHORT_TABLE[i].cmd) { idx = i; break; }
+  }
+  if (idx < 0) { Serial.println("[Short] 未知指令"); return; }
 
-    sendByte(msg.length());
-    for (char c : msg)
-      sendByte((uint8_t)c);
+  uint8_t code = SHORT_TABLE[idx].code;
+
+  // CRC-8校验（只对code这1字节）
+  uint8_t crc = crc8(&code, 1);
+
+  Serial.print("[Short] 发送 ");
+  Serial.print(cmd);
+  Serial.print(" -> code:");
+  Serial.print(code);
+  Serial.print(" CRC:");
+  Serial.println(crc, HEX);
+
+  for (int n = 0; n < FRAME_REPEAT; n++) {
+    // 前导码
+    for (int i = 0; i < 25; i++) sendBit(1);
+
+    // 帧类型：0xBB 表示定长短码帧
+    sendByte(0xBB);
+
+    // 指令码（整字节发送，简单！）
+    sendByte(code);
+
+    // CRC
+    sendByte(crc);
+
+    // 帧尾
     sendByte(0xFF);
+
     delay(FRAME_GAP_MS);
   }
   digitalWrite(ledPin, LOW);
@@ -178,7 +232,7 @@ void applyCommand(const String &command)
   }
   
   lastCommandTime = millis();
-  sendMessage(command);
+  sendShortMessage(command);
   Serial.println("[发送完成]");
   Serial.println("----------------");
 }
