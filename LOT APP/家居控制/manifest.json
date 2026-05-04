@@ -109,7 +109,11 @@
 	},
 	"web": {
 		"router": {
-			"mode": ""
+			"mode": "",
+			"base": "./"
+		},
+		"devServer": {
+			"https": true
 		}
 	}
 }

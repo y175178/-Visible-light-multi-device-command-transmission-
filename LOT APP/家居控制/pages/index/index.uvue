@@ -53,8 +53,8 @@
               <text class="device-icon">💡</text>
               <text class="device-name">灯</text>
               <view class="device-controls">
-                <button class="device-btn" :class="{ active: deviceStatus.light === 1 }" @click="setDeviceState('LIGHT', 1)" :disabled="commandSending">开</button>
-                <button class="device-btn" :class="{ active: deviceStatus.light === 0 }" @click="setDeviceState('LIGHT', 0)" :disabled="commandSending">关</button>
+                <button class="device-btn on" @click="setDeviceState('LIGHT', 1)" :disabled="commandSending">开</button>
+                <button class="device-btn off" @click="setDeviceState('LIGHT', 0)" :disabled="commandSending">关</button>
               </view>
             </view>
 
@@ -63,8 +63,8 @@
               <text class="device-icon">🎚️</text>
               <text class="device-name">舵机</text>
               <view class="device-controls">
-                <button class="device-btn" @click="setDeviceState('SERVO', 1)" :disabled="commandSending">启</button>
-                <button class="device-btn" @click="setDeviceState('SERVO', 0)" :disabled="commandSending">停</button>
+                <button class="device-btn on" @click="setDeviceState('SERVO', 1)" :disabled="commandSending">启</button>
+                <button class="device-btn off" @click="setDeviceState('SERVO', 0)" :disabled="commandSending">停</button>
               </view>
             </view>
 
@@ -102,6 +102,7 @@
 
 <script setup lang="uts">
 import { onMounted, onUnmounted, reactive, ref } from "vue";
+import { onHide } from "@dcloudio/uni-app";
 
 // 主要状态
 const timer = ref<number | null>(null);
@@ -222,6 +223,12 @@ function saveReceivers(): void {
   } catch (e) {
     addLog("保存接收端配置失败", "error");
   }
+}
+
+function persistPageState(): void {
+  saveStateCache();
+  saveTxIp();
+  saveReceivers();
 }
 
 function validateIp(ip: string): boolean {
@@ -437,13 +444,36 @@ function syncTx(): void {
     timeout: 2000,
     success: (res: any) => {
       const data = parseResponseData(res.data);
-      const light = Number(data.light ?? deviceStatus.light);
-      const servo = Number(data.servo ?? deviceStatus.servo);
-      const fan = Number(data.fan ?? deviceStatus.fan);
-
-      deviceStatus.light = light === 1 ? 1 : 0;
-      deviceStatus.servo = servo === 1 ? 1 : 0;
-      deviceStatus.fan = fan === 1 ? 1 : 0;
+      
+      // 处理新的状态格式
+      let light = 0, servo = 0, fan = 0;
+      
+      if (data.confirmed_state) {
+        // 新格式：返回 confirmed_state 和 expected_state
+        const confirmed = data.confirmed_state;
+        const expected = data.expected_state;
+        const syncStatus = data.sync_status;
+        
+        light = Number(confirmed.light ?? 0) === 1 ? 1 : 0;
+        servo = Number(confirmed.servo ?? 0) === 1 ? 1 : 0;
+        fan = Number(confirmed.fan ?? 0) === 1 ? 1 : 0;
+        
+        // 如果状态不一致，表示还在等待反馈
+        if (syncStatus === "waiting_feedback") {
+          addLog(`[等待反馈中] 已发送命令，预期状态: Light=${expected.light}, Servo=${expected.servo}, Fan=${expected.fan}`, "info");
+        }
+      } else {
+        // 旧格式兼容处理
+        light = Number(data.light ?? 0) === 1 ? 1 : 0;
+        servo = Number(data.servo ?? 0) === 1 ? 1 : 0;
+        fan = Number(data.fan ?? 0) === 1 ? 1 : 0;
+      }
+      
+      receivers.value.forEach((rx) => {
+        if (rx.device === "LIGHT") rx.state = light;
+        else if (rx.device === "SERVO") rx.state = servo;
+        else if (rx.device === "FAN") rx.state = fan;
+      });
       saveStateCache();
 
       txConnected.value = true;
@@ -463,7 +493,6 @@ function syncReceiverAck(rxIndex: number): void {
   if (rx.ip.trim().length === 0) {
     rx.connected = false;
     rx.message = "未填IP";
-    rx.state = 0;
     return;
   }
 
@@ -473,15 +502,8 @@ function syncReceiverAck(rxIndex: number): void {
     timeout: 2000,
     success: (res: any) => {
       addLog(`接收端 ${rx.name} 响应: ${JSON.stringify(res.data)}`, "info");
-      const data = parseResponseData(res.data);
-      const state = Number(data.state ?? -1);
       
       rx.connected = true;
-      if (state === 0 || state === 1) {
-        rx.state = state;
-        setDeviceStateByReceiver(rx.device, state);
-        saveStateCache();
-      }
       rx.message = "在线";
       
       updateStats(true);
@@ -498,12 +520,6 @@ function syncReceiverAck(rxIndex: number): void {
 
 function syncAllReceivers(): void {
   receivers.value.forEach((_, index) => syncReceiverAck(index));
-}
-
-function setDeviceStateByReceiver(device: string, val: number): void {
-  if (device === "LIGHT") deviceStatus.light = val;
-  if (device === "SERVO") deviceStatus.servo = val;
-  if (device === "FAN") deviceStatus.fan = val;
 }
 
 // 设备控制
@@ -535,15 +551,9 @@ function setDeviceState(device: string, state: number): void {
       uni.vibrateShort();
       addLog(`${cmd} 成功`, "success");
       
-      // 立即允许下一次点击，后台继续等待确认
+      // 只负责发送命令；状态显示仅由 /status 同步
       commandSending.value = false;
       updateStats(true);
-      
-      // 异步等待接收端确认，不阻塞UI
-      const rxIndex = receivers.value.findIndex((x) => x.device === device);
-      if (rxIndex >= 0) {
-        waitAck(rxIndex, cmd, 0);
-      }
     },
     fail: (err: any) => {
       commandSending.value = false;
@@ -554,86 +564,28 @@ function setDeviceState(device: string, state: number): void {
   });
 }
 
-function waitAck(rxIndex: number, cmd: string, retry: number): void {
-  const maxRetry = 2;  // 只重试2次
-  const rx = receivers.value[rxIndex];
-
-  if (rx.ip.trim().length === 0) {
-    rx.message = "未填IP";
-    return;
-  }
-
-  uni.request({
-    method: "GET",
-    url: rxBase(rx.ip) + "/ack",
-    timeout: 800,  // 缩短到800ms
-    success: (res: any) => {
-      const data = parseResponseData(res.data);
-      const ackCmd = String(data.lastCmd ?? "");
-      
-      rx.connected = true;
-      
-      if (ackCmd === cmd) {
-        const state = Number(data.state ?? 0);
-        rx.message = "✓";
-        rx.state = state;
-        setDeviceStateByReceiver(rx.device, state);
-        saveStateCache();
-        
-        // 临时显示成功状态，500ms后恢复
-        setTimeout(() => {
-          if (rx.message === "✓") {
-            rx.message = "在线";
-          }
-        }, 500);
-        
-        syncTx();
-        return;
-      }
-
-      if (retry < maxRetry) {
-        setTimeout(() => waitAck(rxIndex, cmd, retry + 1), 100);  // 100ms重试
-      } else {
-        rx.message = "✗";
-        setTimeout(() => {
-          if (rx.message === "✗") {
-            rx.message = "在线";
-          }
-        }, 500);
-      }
-    },
-    fail: () => {
-      if (retry < maxRetry) {
-        setTimeout(() => waitAck(rxIndex, cmd, retry + 1), 100);
-      } else {
-        rx.connected = false;
-        rx.message = "✗";
-        // 网络异常时保留上一次状态，不在页面清零
-        setTimeout(() => {
-          if (rx.message === "✗") {
-            rx.message = "离线";
-          }
-        }, 500);
-      }
-    }
-  });
-}
-
 // 生命周期
 onMounted(() => {
   addLog("应用启动", "info");
   loadSettings();
 
+  // 先恢复并展示缓存状态，稍后再进行在线同步
+  setTimeout(() => {
+    syncTx();
+  }, 800);
+
   timer.value = setInterval(() => {
-    if (txConnected.value) {
-      syncTx();
-    }
-    syncAllReceivers();
-  }, 5000);
+    syncTx();
+  }, 1000);
 });
 
 onUnmounted(() => {
+  persistPageState();
   if (timer.value !== null) clearInterval(timer.value);
+});
+
+onHide(() => {
+  persistPageState();
 });
 </script>
 
@@ -1044,3 +996,6 @@ onUnmounted(() => {
 }
 
 </style>
+
+
+
