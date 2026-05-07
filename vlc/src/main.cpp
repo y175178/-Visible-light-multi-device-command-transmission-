@@ -1,18 +1,35 @@
+// ==================== VLC 发射端完整代码（调试版）====================
+// 新增功能：
+//   1. 串口可发送任意字符串指令（不限于6条固定指令）
+//   2. 自动误码率统计（需配合接收端 /ber 接口）
+//   3. 批量自动发送测试模式
+// 编码方案：定长短码（信源编码）+ CRC-8（信道编码）+ 曼彻斯特（物理层）
+
 #include <Arduino.h>
 #include <WebServer.h>
 #include <WiFi.h>
 
+// ==================== 硬件配置 ====================
 const int ledPin = 16;
-const int BIT_PERIOD_US = 1000; // 1000us = 1kbps
-const int FRAME_REPEAT = 2;     // 每条指令重复发送次数
-const int FRAME_GAP_MS = 12;    // 两帧之间间隔
 
-// ===== 定长3bit短码码表 =====
+// ==================== 通信参数 ====================
+const int BIT_PERIOD_US = 1000;  // 1kbps
+const int FRAME_REPEAT  = 2;     // 每条指令重复发送次数
+const int FRAME_GAP_MS  = 12;    // 两帧间隔
+
+// ==================== 帧类型 ====================
+#define FRAME_TYPE_SHORT 0xBB    // 定长短码帧
+#define FRAME_END        0xFF    // 帧尾
+
+// ==================== WiFi配置 ====================
+const char* ssid     = "打扫干净屋子再请客";
+const char* password = "1751787761";
+
+// ==================== 定长短码码表（固定6条指令）====================
 struct ShortEntry {
   const char* cmd;
-  uint8_t     code;  // 1~6
+  uint8_t     code;
 };
-
 const ShortEntry SHORT_TABLE[] = {
   { "LIGHT_ON",  1 },
   { "LIGHT_OFF", 2 },
@@ -22,317 +39,321 @@ const ShortEntry SHORT_TABLE[] = {
   { "FAN_OFF",   6 },
 };
 const int SHORT_TABLE_SIZE = 6;
-// ===== 新增：CRC-8 计算（多项式 0x07）=====
-uint8_t crc8(uint8_t *data, uint8_t len) {
+
+// ==================== 状态管理 ====================
+String expectedLightState = "0";
+String expectedServoState = "0";
+String expectedFanState   = "0";
+unsigned long lastCommandTime = 0;
+bool   lightOn = false;
+bool   servoOn = false;
+bool   fanOn   = false;
+String pendingCommand = "";
+
+// ==================== 误码率统计 ====================
+uint32_t statTotalSent    = 0;   // 总发送帧数
+uint32_t statTotalRecv    = 0;   // 接收端确认收到帧数（由/ber_ack更新）
+uint32_t statCrcFail      = 0;   // 接收端CRC失败帧数（由/ber_ack更新）
+
+// ==================== 自动测试模式 ====================
+bool     autoTestMode     = false;
+uint32_t autoTestTotal    = 0;   // 计划发送总次数
+uint32_t autoTestSent     = 0;   // 已发送次数
+String   autoTestCmd      = "";  // 测试用指令
+uint32_t autoTestInterval = 500; // 每次发送间隔ms
+unsigned long lastAutoSend = 0;
+
+// ==================== 传感器数据 ====================
+String data = "{'light':0,'temp':0,'hum':0}";
+
+WebServer server(5000);
+
+// ============================================================
+//  CRC-8（多项式 0x07）
+// ============================================================
+uint8_t crc8(uint8_t* d, uint8_t len) {
   uint8_t crc = 0x00;
   for (uint8_t i = 0; i < len; i++) {
-    crc ^= data[i];
-    for (uint8_t j = 0; j < 8; j++) {
-      if (crc & 0x80)
-        crc = (crc << 1) ^ 0x07;
-      else
-        crc <<= 1;
-    }
+    crc ^= d[i];
+    for (uint8_t j = 0; j < 8; j++)
+      crc = (crc & 0x80) ? (crc << 1) ^ 0x07 : crc << 1;
   }
   return crc;
 }
 
-void wifiConnect(void);
-void serverStart(void);
-void sendDataHandler(void);
-void controlHandler(void);
-void statusHandler(void);
-void uploadHandler(void);
-void applyCommand(const String &command);
-void queueCommand(const String &command);
-
-String expectedLightState = "0";   // 预期状态
-String expectedServoState = "0";
-String expectedFanState = "0";
-unsigned long lastCommandTime = 0;  // 最后命令发送时间
-
-// 接收端确认的实际状态（由 /upload 更新）
-bool lightOn = false;
-bool servoOn = false;
-bool fanOn = false;
-String pendingCommand = "";
-String data = "{'light':0,'temp':0,'hum':0}";  // 传感器数据
-
-WebServer server(5000);
-
-void sendBit(bool bit)
-{
-  if (bit)
-  {
-    // 曼切斯特编码：1 = 高→低
-    digitalWrite(ledPin, HIGH);
-    delayMicroseconds(BIT_PERIOD_US / 2);
-    digitalWrite(ledPin, LOW);
-    delayMicroseconds(BIT_PERIOD_US / 2);
-  }
-  else
-  {
-    // 曼切斯特编码：0 = 低→高
-    digitalWrite(ledPin, LOW);
-    delayMicroseconds(BIT_PERIOD_US / 2);
-    digitalWrite(ledPin, HIGH);
-    delayMicroseconds(BIT_PERIOD_US / 2);
+// ============================================================
+//  曼彻斯特编码发送
+// ============================================================
+void sendBit(bool bit) {
+  if (bit) {
+    digitalWrite(ledPin, HIGH); delayMicroseconds(BIT_PERIOD_US / 2);
+    digitalWrite(ledPin, LOW);  delayMicroseconds(BIT_PERIOD_US / 2);
+  } else {
+    digitalWrite(ledPin, LOW);  delayMicroseconds(BIT_PERIOD_US / 2);
+    digitalWrite(ledPin, HIGH); delayMicroseconds(BIT_PERIOD_US / 2);
   }
 }
 
-void sendByte(uint8_t b)
-{
-  for (int i = 7; i >= 0; i--)
-    sendBit((b >> i) & 1);
+void sendByte(uint8_t b) {
+  for (int i = 7; i >= 0; i--) sendBit((b >> i) & 1);
 }
 
-// ===== 发送霍夫曼编码帧 =====
-// ===== 发送短码帧（含CRC）=====
-void sendShortMessage(const String &cmd) {
-  int idx = -1;
-  for (int i = 0; i < SHORT_TABLE_SIZE; i++) {
-    if (cmd == SHORT_TABLE[i].cmd) { idx = i; break; }
-  }
-  if (idx < 0) { Serial.println("[Short] 未知指令"); return; }
-
-  uint8_t code = SHORT_TABLE[idx].code;
-
-  // CRC-8校验（只对code这1字节）
+// ============================================================
+//  发送定长短码帧（用于固定6条指令）
+// ============================================================
+void sendShortFrame(uint8_t code) {
   uint8_t crc = crc8(&code, 1);
-
-  Serial.print("[Short] 发送 ");
-  Serial.print(cmd);
-  Serial.print(" -> code:");
-  Serial.print(code);
-  Serial.print(" CRC:");
-  Serial.println(crc, HEX);
-
   for (int n = 0; n < FRAME_REPEAT; n++) {
-    // 前导码
-    for (int i = 0; i < 25; i++) sendBit(1);
-
-    // 帧类型：0xBB 表示定长短码帧
-    sendByte(0xBB);
-
-    // 指令码（整字节发送，简单！）
-    sendByte(code);
-
-    // CRC
-    sendByte(crc);
-
-    // 帧尾
-    sendByte(0xFF);
-
+    for (int i = 0; i < 25; i++) sendBit(1);  // 前导码
+    sendByte(FRAME_TYPE_SHORT);                // 帧类型
+    sendByte(code);                            // 指令码
+    sendByte(crc);                             // CRC
+    sendByte(FRAME_END);                       // 帧尾
     delay(FRAME_GAP_MS);
   }
   digitalWrite(ledPin, LOW);
+  statTotalSent++;
 }
 
-void wifiConnect(void)
-{
-  const char *ssid = "打扫干净屋子再请客";
-  const char *password = "1751787761";
+// ============================================================
+//  发送ASCII帧（用于任意字符串，调试模式）
+//  帧结构：[25bit前导] [长度] [字符串bytes] [CRC] [0xFF]
+// ============================================================
+void sendAsciiFrame(const String& msg) {
+  uint8_t len = (uint8_t)msg.length();
+  // 计算CRC：对长度+内容做校验
+  uint8_t buf[65];
+  buf[0] = len;
+  for (int i = 0; i < len; i++) buf[i + 1] = (uint8_t)msg[i];
+  uint8_t crc = crc8(buf, len + 1);
 
-  Serial.println("Connecting WiFi...");
-  WiFi.setSleep(false); // 降低WiFi省电造成的时序抖动
-  WiFi.begin(ssid, password);
+  for (int n = 0; n < FRAME_REPEAT; n++) {
+    for (int i = 0; i < 25; i++) sendBit(1);  // 前导码
+    sendByte(len);                             // 帧类型/长度（非0xBB即ASCII帧）
+    for (char c : msg) sendByte((uint8_t)c);  // 内容
+    sendByte(crc);                             // CRC（新增）
+    sendByte(FRAME_END);                       // 帧尾
+    delay(FRAME_GAP_MS);
+  }
+  digitalWrite(ledPin, LOW);
+  statTotalSent++;
+}
 
-  while (WiFi.status() != WL_CONNECTED)
-  {
-    delay(500);
-    Serial.print(".");
+// ============================================================
+//  执行并发送指令（自动选择帧类型）
+// ============================================================
+void applyCommand(const String& command) {
+  Serial.print("[发送] "); Serial.println(command);
+
+  // 更新预期状态
+  if      (command == "LIGHT_ON")  expectedLightState = "1";
+  else if (command == "LIGHT_OFF") expectedLightState = "0";
+  else if (command == "SERVO_ON")  expectedServoState = "1";
+  else if (command == "SERVO_OFF") expectedServoState = "0";
+  else if (command == "FAN_ON")    expectedFanState   = "1";
+  else if (command == "FAN_OFF")   expectedFanState   = "0";
+
+  lastCommandTime = millis();
+
+  // 查短码表
+  int idx = -1;
+  for (int i = 0; i < SHORT_TABLE_SIZE; i++) {
+    if (command == SHORT_TABLE[i].cmd) { idx = i; break; }
   }
 
-  Serial.println("");
-  Serial.println("WiFi 连接成功！");
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
+  if (idx >= 0) {
+    // 固定指令：用定长短码帧
+    Serial.print("[短码帧] code="); Serial.println(SHORT_TABLE[idx].code);
+    sendShortFrame(SHORT_TABLE[idx].code);
+  } else {
+    // 任意指令：用ASCII帧（调试模式）
+    Serial.println("[ASCII帧] 任意指令模式");
+    sendAsciiFrame(command);
+  }
+
+  Serial.println("[发送完成] ----------------");
 }
 
-void serverStart(void)
-{
-  server.on("/data", sendDataHandler);
-  server.on("/status", statusHandler);
-  server.on("/control", HTTP_POST, controlHandler);
-  server.on("/control", HTTP_GET, controlHandler);
-  server.on("/upload", HTTP_GET, uploadHandler);
-  server.begin();
-  Serial.println("Web 服务器已启动");
-}
+void queueCommand(const String& command) { pendingCommand = command; }
 
-void addCorsHeaders()
-{
+// ============================================================
+//  HTTP：CORS头
+// ============================================================
+void addCorsHeaders() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
-void sendDataHandler()
-{
-  data = "{'light':1,'temp':30,'hum':60}";
+// ============================================================
+//  HTTP：/data
+// ============================================================
+void sendDataHandler() {
   addCorsHeaders();
   server.send(200, "text/plain", data);
 }
 
-void statusHandler(void)
-{
+// ============================================================
+//  HTTP：/status
+// ============================================================
+void statusHandler() {
   addCorsHeaders();
-  
-  // 计算自上次命令以来的时间（毫秒）
-  unsigned long timeSinceCommand = (lastCommandTime > 0) ? (millis() - lastCommandTime) : 999999;
-  bool isWaitingFeedback = (timeSinceCommand < 2000); // 2秒内视为等待反馈
-  
-  String status = "{";
-  status += "\"confirmed_state\":{";
-  status += "\"light\":";
-  status += (lightOn ? "1" : "0");
-  status += ",\"servo\":";
-  status += (servoOn ? "1" : "0");
-  status += ",\"fan\":";
-  status += (fanOn ? "1" : "0");
-  status += "},";
-  
-  status += "\"expected_state\":{";
-  status += "\"light\":";
-  status += expectedLightState;
-  status += ",\"servo\":";
-  status += expectedServoState;
-  status += ",\"fan\":";
-  status += expectedFanState;
-  status += "},";
-  
-  status += "\"sync_status\":\"";
-  status += isWaitingFeedback ? "waiting_feedback" : "ready";
-  status += "\",";
-  status += "\"time_since_command\":";
-  status += String(timeSinceCommand);
-  status += "}";
+  unsigned long timeSince = (lastCommandTime > 0) ? (millis() - lastCommandTime) : 999999;
+  bool waiting = (timeSince < 2000);
 
-  server.send(200, "application/json", status);
+  String s = "{";
+  s += "\"confirmed_state\":{\"light\":" + String(lightOn?1:0) + ",\"servo\":" + String(servoOn?1:0) + ",\"fan\":" + String(fanOn?1:0) + "},";
+  s += "\"expected_state\":{\"light\":" + expectedLightState + ",\"servo\":" + expectedServoState + ",\"fan\":" + expectedFanState + "},";
+  s += "\"sync_status\":\"" + String(waiting ? "waiting_feedback" : "ready") + "\",";
+  s += "\"time_since_command\":" + String(timeSince) + "}";
+  server.send(200, "application/json", s);
 }
 
-void applyCommand(const String &command)
-{
-  Serial.print("[发送] ");
-  Serial.println(command);
-  
-  // 根据命令更新预期状态
-  if (command == "LIGHT_ON") {
-    expectedLightState = "1";
-  } else if (command == "LIGHT_OFF") {
-    expectedLightState = "0";
-  } else if (command == "SERVO_ON") {
-    expectedServoState = "1";
-  } else if (command == "SERVO_OFF") {
-    expectedServoState = "0";
-  } else if (command == "FAN_ON") {
-    expectedFanState = "1";
-  } else if (command == "FAN_OFF") {
-    expectedFanState = "0";
-  }
-  
-  lastCommandTime = millis();
-  sendShortMessage(command);
-  Serial.println("[发送完成]");
-  Serial.println("----------------");
-}
-
-void controlHandler(void)
-{
+// ============================================================
+//  HTTP：/control（App发送指令）
+// ============================================================
+void controlHandler() {
   addCorsHeaders();
   String command = server.arg("cmd");
-  command.trim();
-  command.toUpperCase();
+  command.trim(); command.toUpperCase();
 
-  if (command.length() == 0)
-  {
+  if (command.length() == 0) {
     server.send(400, "application/json", "{\"ok\":false,\"message\":\"missing cmd\"}");
     return;
   }
 
-  if (command != "LIGHT_ON" && command != "LIGHT_OFF" &&
-      command != "SERVO_ON" && command != "SERVO_OFF" &&
-      command != "FAN_ON" && command != "FAN_OFF")
-  {
-    server.send(400, "application/json", "{\"ok\":false,\"message\":\"invalid cmd\"}");
-    return;
-  }
-
-  // 根据命令解析预期的设备状态
-  String device = "";
-  int expectedState = 0;
-  if (command == "LIGHT_ON" || command == "LIGHT_OFF") {
-    device = "LIGHT";
-    expectedState = (command == "LIGHT_ON") ? 1 : 0;
-  } else if (command == "SERVO_ON" || command == "SERVO_OFF") {
-    device = "SERVO";
-    expectedState = (command == "SERVO_ON") ? 1 : 0;
-  } else if (command == "FAN_ON" || command == "FAN_OFF") {
-    device = "FAN";
-    expectedState = (command == "FAN_ON") ? 1 : 0;
-  }
-
-  // 返回响应：包含命令、预期状态、和当前确认状态
-  String result = "{\"ok\":true,\"cmd\":\"";
-  result += command;
-  result += "\",\"device\":\"";
-  result += device;
-  result += "\",\"expected_state\":";
-  result += expectedState;
-  result += ",\"confirmed_light\":";
-  result += (lightOn ? "1" : "0");
-  result += ",\"confirmed_servo\":";
-  result += (servoOn ? "1" : "0");
-  result += ",\"confirmed_fan\":";
-  result += (fanOn ? "1" : "0");
-  result += ",\"status\":\"command_sent_waiting_feedback\"}";
+  String result = "{\"ok\":true,\"cmd\":\"" + command + "\",\"status\":\"command_sent_waiting_feedback\"}";
   server.send(200, "application/json", result);
-
-  // 先响应HTTP，避免App在发光发送期间超时
   queueCommand(command);
 }
 
-void uploadHandler(void)
-{
+// ============================================================
+//  HTTP：/upload（接收端回报设备状态）
+// ============================================================
+void uploadHandler() {
   addCorsHeaders();
-  String device = server.arg("device");
+  String device   = server.arg("device"); device.trim(); device.toUpperCase();
   String stateStr = server.arg("state");
-  device.trim();
-  device.toUpperCase();
-  
-  int state = stateStr.toInt();
-  
-  // 更新对应设备的状态
-  if (device == "LIGHT")
-    lightOn = (state == 1);
-  else if (device == "SERVO")
-    servoOn = (state == 1);
-  else if (device == "FAN")
-    fanOn = (state == 1);
-  
-  Serial.print("[接收端上报] ");
-  Serial.print(device);
-  Serial.print(" 状态: ");
-  Serial.print(state);
-  Serial.print(" -> 已更新为: ");
-  Serial.println(state == 1 ? "ON" : "OFF");
-  
-  String result = "{\"ok\":true,\"device\":\"";
-  result += device;
-  result += "\",\"state\":";
-  result += state;
-  result += "}";
-  server.send(200, "application/json", result);
+  int    state    = stateStr.toInt();
+
+  if      (device == "LIGHT") lightOn = (state == 1);
+  else if (device == "SERVO") servoOn = (state == 1);
+  else if (device == "FAN")   fanOn   = (state == 1);
+
+  Serial.print("[上报] "); Serial.print(device);
+  Serial.print(" -> "); Serial.println(state ? "ON" : "OFF");
+
+  server.send(200, "application/json",
+    "{\"ok\":true,\"device\":\"" + device + "\",\"state\":" + state + "}");
 }
 
-void queueCommand(const String &command)
-{
-  pendingCommand = command;
+// ============================================================
+//  HTTP：/ber_ack（接收端上报误码率统计）
+//  接收端调用：/ber_ack?recv=N&crc_fail=M
+// ============================================================
+void berAckHandler() {
+  addCorsHeaders();
+  String recvStr    = server.arg("recv");
+  String crcFailStr = server.arg("crc_fail");
+
+  if (recvStr.length() > 0)    statTotalRecv = recvStr.toInt();
+  if (crcFailStr.length() > 0) statCrcFail   = crcFailStr.toInt();
+
+  Serial.print("[BER] 接收端上报 recv="); Serial.print(statTotalRecv);
+  Serial.print(" crc_fail="); Serial.println(statCrcFail);
+
+  server.send(200, "application/json", "{\"ok\":true}");
 }
 
-void setup()
-{
-  // ✅ 第一步必须开串口！！！（你之前放错位置）
+// ============================================================
+//  HTTP：/ber_stat（查询误码率统计）
+// ============================================================
+void berStatHandler() {
+  addCorsHeaders();
+  uint32_t lost    = (statTotalSent > statTotalRecv) ? (statTotalSent - statTotalRecv) : 0;
+  float    per     = (statTotalSent > 0) ? (float)lost / statTotalSent * 100.0f : 0.0f;
+  float    crcRate = (statTotalRecv > 0) ? (float)statCrcFail / statTotalRecv * 100.0f : 0.0f;
+
+  String s = "{";
+  s += "\"total_sent\":"    + String(statTotalSent)  + ",";
+  s += "\"total_recv\":"    + String(statTotalRecv)  + ",";
+  s += "\"lost\":"          + String(lost)           + ",";
+  s += "\"loss_rate\":"     + String(per, 2)         + ",";
+  s += "\"crc_fail\":"      + String(statCrcFail)    + ",";
+  s += "\"crc_fail_rate\":" + String(crcRate, 2)     + "}";
+  server.send(200, "application/json", s);
+}
+
+// ============================================================
+//  HTTP：/ber_reset（重置统计）
+// ============================================================
+void berResetHandler() {
+  addCorsHeaders();
+  statTotalSent = statTotalRecv = statCrcFail = 0;
+  Serial.println("[BER] 统计已重置");
+  server.send(200, "application/json", "{\"ok\":true,\"message\":\"reset ok\"}");
+}
+
+// ============================================================
+//  自动测试：打印当前进度
+// ============================================================
+void printAutoTestProgress() {
+  Serial.print("[自动测试] ");
+  Serial.print(autoTestSent); Serial.print("/"); Serial.print(autoTestTotal);
+  Serial.print("  已发="); Serial.print(statTotalSent);
+  Serial.print("  收到="); Serial.print(statTotalRecv);
+  Serial.print("  CRC失败="); Serial.println(statCrcFail);
+}
+
+// ============================================================
+//  WiFi连接
+// ============================================================
+void wifiConnect() {
+  Serial.println("Connecting WiFi...");
+  WiFi.setSleep(false);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\nWiFi 连接成功！IP: " + WiFi.localIP().toString());
+}
+
+// ============================================================
+//  服务器启动
+// ============================================================
+void serverStart() {
+  server.on("/data",      sendDataHandler);
+  server.on("/status",    statusHandler);
+  server.on("/control",   HTTP_GET,  controlHandler);
+  server.on("/control",   HTTP_POST, controlHandler);
+  server.on("/upload",    HTTP_GET,  uploadHandler);
+  server.on("/ber_ack",   HTTP_GET,  berAckHandler);
+  server.on("/ber_stat",  HTTP_GET,  berStatHandler);
+  server.on("/ber_reset", HTTP_GET,  berResetHandler);
+  server.begin();
+  Serial.println("[Web] 服务器已启动（端口5000）");
+}
+
+// ============================================================
+//  打印帮助
+// ============================================================
+void printHelp() {
+  Serial.println("\n========== 串口命令 ==========");
+  Serial.println("  直接输入任意字符串   → 发送该字符串（ASCII帧）");
+  Serial.println("  LIGHT_ON/OFF         → 发送固定指令（短码帧）");
+  Serial.println("  SERVO_ON/OFF         → 发送固定指令（短码帧）");
+  Serial.println("  FAN_ON/OFF           → 发送固定指令（短码帧）");
+  Serial.println("  stat                 → 查看误码率统计");
+  Serial.println("  reset                → 重置误码率统计");
+  Serial.println("  auto N CMD [interval]→ 自动发送CMD共N次，间隔Xms（默认500ms）");
+  Serial.println("    例：auto 100 LIGHT_ON 300");
+  Serial.println("  stop                 → 停止自动测试");
+  Serial.println("  help                 → 显示本菜单");
+  Serial.println("==============================\n");
+}
+
+// ============================================================
+//  setup
+// ============================================================
+void setup() {
   Serial.begin(115200);
   delay(100);
 
@@ -340,39 +361,123 @@ void setup()
   serverStart();
 
   Serial.println("========================");
-  Serial.println(" VLC 发射端已准备就绪");
-  Serial.println(" 请在串口输入指令发送");
+  Serial.println(" VLC 发射端（调试版）");
   Serial.println("========================");
 
   pinMode(ledPin, OUTPUT);
   digitalWrite(ledPin, LOW);
+
+  printHelp();
 }
 
-void loop()
-{
+// ============================================================
+//  loop
+// ============================================================
+void loop() {
   server.handleClient();
 
-  if (pendingCommand.length() > 0)
-  {
-    String commandToSend = pendingCommand;
+  // 执行队列中的指令
+  if (pendingCommand.length() > 0) {
+    String cmd = pendingCommand;
     pendingCommand = "";
-    applyCommand(commandToSend);
+    applyCommand(cmd);
   }
 
-  if (Serial.available())
-  {
-    // ✅ 读取并清空缓存
-    String command = Serial.readStringUntil('\n');
-    command.trim();
-    command.toUpperCase();
-
-    if (command.length() > 0)
-    {
-      applyCommand(command);
-
-      // 清空串口，防止重复发送
-      Serial.flush();
-      delay(500);
+  // 自动测试模式
+  if (autoTestMode) {
+    if (autoTestSent >= autoTestTotal) {
+      autoTestMode = false;
+      Serial.println("\n[自动测试] 完成！");
+      printAutoTestProgress();
+      // 打印最终统计
+      uint32_t lost = (statTotalSent > statTotalRecv) ? (statTotalSent - statTotalRecv) : 0;
+      float per = (statTotalSent > 0) ? (float)lost / statTotalSent * 100.0f : 0.0f;
+      Serial.print("[自动测试] 丢帧率: "); Serial.print(per, 2); Serial.println("%");
+      Serial.print("[自动测试] CRC失败: "); Serial.println(statCrcFail);
+    } else if (millis() - lastAutoSend >= autoTestInterval) {
+      lastAutoSend = millis();
+      applyCommand(autoTestCmd);
+      autoTestSent++;
+      if (autoTestSent % 10 == 0) printAutoTestProgress();
     }
+  }
+
+  // 串口命令处理
+  if (Serial.available()) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    if (input.length() == 0) return;
+
+    String inputUpper = input;
+    inputUpper.toUpperCase();
+
+    // ---- 内置命令 ----
+    if (inputUpper == "STAT") {
+      uint32_t lost = (statTotalSent > statTotalRecv) ? (statTotalSent - statTotalRecv) : 0;
+      float per     = (statTotalSent > 0) ? (float)lost / statTotalSent * 100.0f : 0.0f;
+      float crcRate = (statTotalRecv > 0) ? (float)statCrcFail / statTotalRecv * 100.0f : 0.0f;
+      Serial.println("\n===== 误码率统计 =====");
+      Serial.print("总发送帧:    "); Serial.println(statTotalSent);
+      Serial.print("接收端收到:  "); Serial.println(statTotalRecv);
+      Serial.print("丢失帧:      "); Serial.println(lost);
+      Serial.print("丢帧率:      "); Serial.print(per, 2); Serial.println("%");
+      Serial.print("CRC失败帧:   "); Serial.println(statCrcFail);
+      Serial.print("CRC失败率:   "); Serial.print(crcRate, 2); Serial.println("%");
+      Serial.println("======================\n");
+      return;
+    }
+
+    if (inputUpper == "RESET") {
+      statTotalSent = statTotalRecv = statCrcFail = 0;
+      Serial.println("[统计] 已重置");
+      return;
+    }
+
+    if (inputUpper == "STOP") {
+      autoTestMode = false;
+      Serial.println("[自动测试] 已停止");
+      return;
+    }
+
+    if (inputUpper == "HELP") { printHelp(); return; }
+
+    // ---- 自动测试：auto N CMD [interval] ----
+    if (inputUpper.startsWith("AUTO ")) {
+      // 解析参数
+      String params = input.substring(5);  // 去掉"auto "
+      params.trim();
+      int sp1 = params.indexOf(' ');
+      if (sp1 < 0) { Serial.println("格式错误，例：auto 100 LIGHT_ON 300"); return; }
+
+      autoTestTotal    = params.substring(0, sp1).toInt();
+      String rest      = params.substring(sp1 + 1);
+      rest.trim();
+      int sp2          = rest.indexOf(' ');
+      if (sp2 >= 0) {
+        autoTestCmd      = rest.substring(0, sp2);
+        autoTestInterval = rest.substring(sp2 + 1).toInt();
+      } else {
+        autoTestCmd      = rest;
+        autoTestInterval = 500;
+      }
+      autoTestCmd.toUpperCase();
+      autoTestSent  = 0;
+      autoTestMode  = true;
+      lastAutoSend  = 0;
+      statTotalSent = statTotalRecv = statCrcFail = 0;  // 自动重置统计
+
+      Serial.print("[自动测试] 开始，指令=");
+      Serial.print(autoTestCmd);
+      Serial.print(" 总次数="); Serial.print(autoTestTotal);
+      Serial.print(" 间隔="); Serial.print(autoTestInterval); Serial.println("ms");
+      return;
+    }
+
+    // ---- 普通发送：任意字符串 ----
+    inputUpper.trim();
+    applyCommand(inputUpper);
+
+    Serial.flush();
+    delay(200);
   }
 }
