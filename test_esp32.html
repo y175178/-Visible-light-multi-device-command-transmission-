@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>ESP32连接测试</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .result {
+            background: white;
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .success { border-left: 4px solid #10b981; }
+        .error { border-left: 4px solid #ef4444; }
+        button {
+            background: #0e6fee;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 16px;
+            margin: 5px;
+        }
+        button:hover { background: #2d7de4; }
+        iframe {
+            width: 100%;
+            height: 600px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    <h1>🔍 ESP32发射端连接测试</h1>
+
+    <div class="result success">
+        <h2>✅ 网络测试通过</h2>
+        <p>curl测试显示ESP32发射端工作正常！</p>
+        <p><strong>发射端地址：</strong> http://192.168.198.53:5000/</p>
+    </div>
+
+    <div style="text-align: center;">
+        <button onclick="openInNewTab()">🚀 在新标签页打开ESP32控制台</button>
+        <button onclick="testFetch()">🧪 测试Fetch API</button>
+        <button onclick="showInIframe()">📺 在下方iframe中显示</button>
+    </div>
+
+    <div id="fetchResult"></div>
+    <div id="iframeContainer"></div>
+
+    <script>
+        const ESP32_URL = 'http://192.168.198.53:5000/';
+
+        function openInNewTab() {
+            window.open(ESP32_URL, '_blank');
+        }
+
+        async function testFetch() {
+            const resultDiv = document.getElementById('fetchResult');
+            resultDiv.innerHTML = '<div class="result"><p>测试中...</p></div>';
+
+            try {
+                const response = await fetch(ESP32_URL);
+                const text = await response.text();
+
+                resultDiv.innerHTML = `
+                    <div class="result success">
+                        <h3>✅ Fetch API 测试成功</h3>
+                        <p><strong>状态码：</strong> ${response.status}</p>
+                        <p><strong>内容长度：</strong> ${text.length} 字节</p>
+                        <details>
+                            <summary>查看HTML内容</summary>
+                            <pre style="background: #f0f0f0; padding: 10px; overflow-x: auto;">${text.substring(0, 500)}...</pre>
+                        </details>
+                    </div>
+                `;
+            } catch (error) {
+                resultDiv.innerHTML = `
+                    <div class="result error">
+                        <h3>❌ Fetch API 测试失败</h3>
+                        <p><strong>错误：</strong> ${error.message}</p>
+                        <p>可能是CORS问题或网络问题</p>
+                    </div>
+                `;
+            }
+        }
+
+        function showInIframe() {
+            const container = document.getElementById('iframeContainer');
+            container.innerHTML = `
+                <h2>ESP32控制台（iframe）</h2>
+                <iframe src="${ESP32_URL}"></iframe>
+            `;
+        }
+
+        // 页面加载时自动测试
+        window.onload = () => {
+            console.log('页面加载完成，ESP32地址：', ESP32_URL);
+        };
+    </script>
+</body>
+</html>

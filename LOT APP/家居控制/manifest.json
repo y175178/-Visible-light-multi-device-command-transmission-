@@ -110,10 +110,10 @@
 	"web": {
 		"router": {
 			"mode": "",
-			"base": "./"
+			"base": ""
 		},
 		"devServer": {
-			"https": true
+			"https": false
 		}
 	}
 }

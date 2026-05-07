@@ -23,7 +23,7 @@ const int FRAME_GAP_MS  = 12;    // 两帧间隔
 
 // ==================== WiFi配置 ====================
 const char* ssid     = "打扫干净屋子再请客";
-const char* password = "1751787761";
+const char* password = "1751787761";  // 请替换为实际密码
 
 // ==================== 定长短码码表（固定6条指令）====================
 struct ShortEntry {
@@ -295,6 +295,53 @@ void berResetHandler() {
 }
 
 // ============================================================
+//  HTTP：/ 根路径（状态页面）
+// ============================================================
+void handleRoot() {
+  uint32_t lost = (statTotalSent > statTotalRecv) ? (statTotalSent - statTotalRecv) : 0;
+  float per = (statTotalSent > 0) ? (float)lost / statTotalSent * 100.0f : 0.0f;
+  float crcRate = (statTotalRecv > 0) ? (float)statCrcFail / statTotalRecv * 100.0f : 0.0f;
+
+  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
+  html += "<meta http-equiv='refresh' content='3'>";
+  html += "<style>body{font-family:Arial;margin:40px;background:#f0f0f0;}";
+  html += ".card{background:white;padding:20px;margin:10px 0;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1);}";
+  html += "h1{color:#333;}h2{color:#666;border-bottom:2px solid #4CAF50;padding-bottom:10px;}";
+  html += ".status{font-size:18px;margin:10px 0;}.on{color:green;font-weight:bold;}.off{color:red;font-weight:bold;}";
+  html += ".stat{display:flex;justify-content:space-between;padding:8px;border-bottom:1px solid #eee;}";
+  html += ".stat:last-child{border:none;}</style></head><body>";
+
+  html += "<h1>🚀 VLC 发射端控制台</h1>";
+
+  html += "<div class='card'><h2>设备状态</h2>";
+  html += "<div class='status'>💡 灯光: <span class='" + String(lightOn?"on":"off") + "'>" + (lightOn?"ON":"OFF") + "</span></div>";
+  html += "<div class='status'>🔧 舵机: <span class='" + String(servoOn?"on":"off") + "'>" + (servoOn?"ON":"OFF") + "</span></div>";
+  html += "<div class='status'>🌀 风扇: <span class='" + String(fanOn?"on":"off") + "'>" + (fanOn?"ON":"OFF") + "</span></div>";
+  html += "</div>";
+
+  html += "<div class='card'><h2>📊 误码率统计</h2>";
+  html += "<div class='stat'><span>总发送帧数:</span><span><b>" + String(statTotalSent) + "</b></span></div>";
+  html += "<div class='stat'><span>接收端确认:</span><span><b>" + String(statTotalRecv) + "</b></span></div>";
+  html += "<div class='stat'><span>丢失帧数:</span><span><b>" + String(lost) + "</b></span></div>";
+  html += "<div class='stat'><span>丢帧率:</span><span><b>" + String(per, 2) + "%</b></span></div>";
+  html += "<div class='stat'><span>CRC失败:</span><span><b>" + String(statCrcFail) + "</b></span></div>";
+  html += "<div class='stat'><span>CRC失败率:</span><span><b>" + String(crcRate, 2) + "%</b></span></div>";
+  html += "</div>";
+
+  html += "<div class='card'><h2>🔗 API 接口</h2>";
+  html += "<p><a href='/status'>/status</a> - 设备状态JSON</p>";
+  html += "<p><a href='/ber_stat'>/ber_stat</a> - 误码率统计JSON</p>";
+  html += "<p><a href='/control?cmd=LIGHT_ON'>/control?cmd=LIGHT_ON</a> - 发送指令</p>";
+  html += "<p><a href='/ber_reset'>/ber_reset</a> - 重置统计</p>";
+  html += "</div>";
+
+  html += "<p style='text-align:center;color:#999;margin-top:30px;'>页面每3秒自动刷新</p>";
+  html += "</body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+// ============================================================
 //  自动测试：打印当前进度
 // ============================================================
 void printAutoTestProgress() {
@@ -320,6 +367,7 @@ void wifiConnect() {
 //  服务器启动
 // ============================================================
 void serverStart() {
+  server.on("/",          handleRoot);
   server.on("/data",      sendDataHandler);
   server.on("/status",    statusHandler);
   server.on("/control",   HTTP_GET,  controlHandler);

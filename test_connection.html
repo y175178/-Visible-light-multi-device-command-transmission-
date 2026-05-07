@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>VLC 发射端连接测试</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .test-card {
+            background: white;
+            padding: 20px;
+            margin: 10px 0;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 { color: #333; }
+        .test-item {
+            padding: 10px;
+            margin: 5px 0;
+            border-left: 4px solid #ccc;
+            background: #f9f9f9;
+        }
+        .success { border-color: #10b981; background: #f0fdf4; }
+        .error { border-color: #ef4444; background: #fef2f2; }
+        .pending { border-color: #f59e0b; background: #fffbeb; }
+        button {
+            background: #0e6fee;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:hover { background: #2d7de4; }
+        input {
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            width: 200px;
+            font-size: 14px;
+        }
+        .log {
+            background: #1a1a1a;
+            color: #0f0;
+            padding: 15px;
+            border-radius: 6px;
+            font-family: monospace;
+            font-size: 12px;
+            max-height: 300px;
+            overflow-y: auto;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <h1>🔍 VLC 发射端连接诊断工具</h1>
+
+    <div class="test-card">
+        <h2>配置</h2>
+        <label>发射端IP: <input type="text" id="txIp" value="192.168.198.53" placeholder="192.168.198.53"></label>
+        <label>端口: <input type="text" id="txPort" value="5000" placeholder="5000" style="width: 80px;"></label>
+        <br><br>
+        <button onclick="runTests()">🚀 开始测试</button>
+        <button onclick="clearLog()">🗑️ 清空日志</button>
+    </div>
+
+    <div class="test-card">
+        <h2>测试结果</h2>
+        <div id="results"></div>
+    </div>
+
+    <div class="test-card">
+        <h2>详细日志</h2>
+        <div id="log" class="log"></div>
+    </div>
+
+    <script>
+        function log(msg, type = 'info') {
+            const logDiv = document.getElementById('log');
+            const time = new Date().toLocaleTimeString();
+            const color = type === 'error' ? '#ff6b6b' : type === 'success' ? '#51cf66' : '#0f0';
+            logDiv.innerHTML += `<div style="color: ${color}">[${time}] ${msg}</div>`;
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+
+        function clearLog() {
+            document.getElementById('log').innerHTML = '';
+            document.getElementById('results').innerHTML = '';
+        }
+
+        function addResult(name, status, message) {
+            const resultsDiv = document.getElementById('results');
+            const statusClass = status === 'success' ? 'success' : status === 'error' ? 'error' : 'pending';
+            const icon = status === 'success' ? '✅' : status === 'error' ? '❌' : '⏳';
+            resultsDiv.innerHTML += `<div class="test-item ${statusClass}">${icon} <strong>${name}</strong>: ${message}</div>`;
+        }
+
+        async function testUrl(url, testName) {
+            log(`测试: ${testName} - ${url}`);
+            addResult(testName, 'pending', '测试中...');
+
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+                const response = await fetch(url, {
+                    method: 'GET',
+                    signal: controller.signal,
+                    mode: 'cors'
+                });
+
+                clearTimeout(timeoutId);
+
+                const text = await response.text();
+                log(`✓ ${testName} 成功 (状态: ${response.status})`, 'success');
+                log(`响应内容: ${text.substring(0, 200)}...`, 'info');
+
+                // 更新结果
+                const lastResult = document.querySelector('.test-item:last-child');
+                lastResult.className = 'test-item success';
+                lastResult.innerHTML = `✅ <strong>${testName}</strong>: 成功 (HTTP ${response.status})`;
+
+                return { success: true, data: text };
+            } catch (error) {
+                log(`✗ ${testName} 失败: ${error.message}`, 'error');
+
+                // 更新结果
+                const lastResult = document.querySelector('.test-item:last-child');
+                lastResult.className = 'test-item error';
+                lastResult.innerHTML = `❌ <strong>${testName}</strong>: ${error.message}`;
+
+                return { success: false, error: error.message };
+            }
+        }
+
+        async function runTests() {
+            clearLog();
+
+            const ip = document.getElementById('txIp').value.trim();
+            const port = document.getElementById('txPort').value.trim();
+            const baseUrl = `http://${ip}:${port}`;
+
+            log('========================================', 'info');
+            log(`开始测试发射端: ${baseUrl}`, 'info');
+            log('========================================', 'info');
+
+            // 测试1: 根路径
+            await testUrl(`${baseUrl}/`, '根路径 (/)');
+            await new Promise(r => setTimeout(r, 500));
+
+            // 测试2: /status
+            await testUrl(`${baseUrl}/status`, '状态接口 (/status)');
+            await new Promise(r => setTimeout(r, 500));
+
+            // 测试3: /data
+            await testUrl(`${baseUrl}/data`, '数据接口 (/data)');
+            await new Promise(r => setTimeout(r, 500));
+
+            // 测试4: /ber_stat
+            await testUrl(`${baseUrl}/ber_stat`, '误码率统计 (/ber_stat)');
+            await new Promise(r => setTimeout(r, 500));
+
+            log('========================================', 'info');
+            log('测试完成！', 'success');
+            log('========================================', 'info');
+        }
+
+        // 页面加载时自动运行一次测试
+        window.onload = () => {
+            log('诊断工具已就绪', 'success');
+            log('点击"开始测试"按钮进行连接测试', 'info');
+        };
+    </script>
+</body>
+</html>

@@ -18,12 +18,12 @@ int adcThreshold        = 13;    // 启动时自动校准覆盖此值
 
 // ==================== 设备角色 ====================
 // 1=LIGHT  2=SERVO  3=FAN
-const int DEVICE_ROLE = 2;
+const int DEVICE_ROLE = 1;
 
 // ==================== WiFi配置 ====================
 const char* ssid     = "打扫干净屋子再请客";
 const char* password = "1751787761";
-const char* txHost   = "192.168.54.52";
+const char* txHost   = "192.168.198.53";
 const int   txPort   = 5000;
 
 // ==================== 帧类型 ====================
@@ -385,6 +385,17 @@ void handleBerReset() {
 }
 
 // ============================================================
+//  Web服务器：/recalibrate（远程触发阈值重校准）
+// ============================================================
+void handleRecalibrate() {
+  sendCorsHeaders();
+  Serial.println("[校准] 远程触发阈值重校准...");
+  int newThreshold = autoCalibrate();
+  String json = "{\"ok\":true,\"threshold\":" + String(newThreshold) + "}";
+  server.send(200, "application/json", json);
+}
+
+// ============================================================
 //  Web服务器：/ 状态页
 // ============================================================
 void handleRoot() {
@@ -437,6 +448,9 @@ void doWifiUpload() {
         delay(200); client.stop();
         Serial.println("[WiFi] 状态已上报");
         wifiUploadPending = false;
+      } else {
+        Serial.println("[WiFi] 连接发射端失败");
+        wifiUploadPending = false;  // 失败也清除标志，避免死循环
       }
     }
 
@@ -448,10 +462,16 @@ void doWifiUpload() {
         delay(200); client.stop();
         Serial.println("[WiFi] 误码统计已上报");
         wifiBerPending = false;
+      } else {
+        Serial.println("[WiFi] 连接发射端失败");
+        wifiBerPending = false;  // 失败也清除标志，避免死循环
       }
     }
   } else {
     Serial.println("[WiFi] 连接失败");
+    // ★ 关键修复：连接失败时也要清除标志
+    wifiUploadPending = false;
+    wifiBerPending = false;
   }
 
   WiFi.mode(WIFI_OFF); WiFi.forceSleepBegin();
@@ -490,18 +510,51 @@ void setup() {
   WiFi.mode(WIFI_OFF);
   WiFi.forceSleepBegin();
   delay(100);
-  Serial.println("[WiFi] 已关闭");
 
   // ★ 自动阈值校准
   adcThreshold = autoCalibrate();
 
-  // 启动Web服务器（此时WiFi关闭，服务器在WiFi唤醒时才可访问）
-  server.on("/",          handleRoot);
-  server.on("/ack",       handleAck);
-  server.on("/ber",       handleBer);
-  server.on("/ber_reset", handleBerReset);
+  // 校准完成后启动WiFi和Web服务器
+  Serial.println("[WiFi] 连接中...");
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(ssid, password);
+
+  unsigned long t = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t < 20000) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[WiFi] 连接成功！");
+    Serial.println("========================");
+    Serial.print("设备ID: ESP8266-接收端-");
+    Serial.println(roleName());
+    Serial.print("IP地址: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("端口: 80");
+    Serial.println();
+    Serial.print("访问地址: http://");
+    Serial.print(WiFi.localIP());
+    Serial.println("/");
+    Serial.print("配置的发射端IP: ");
+    Serial.print(txHost);
+    Serial.print(":");
+    Serial.println(txPort);
+    Serial.println("========================");
+  } else {
+    Serial.println("\n[WiFi] 连接失败");
+  }
+
+  // 启动Web服务器
+  server.on("/",            handleRoot);
+  server.on("/ack",         handleAck);
+  server.on("/ber",         handleBer);
+  server.on("/ber_reset",   handleBerReset);
+  server.on("/recalibrate", handleRecalibrate);
   server.begin();
-  Serial.println("[Web] 服务器已注册（端口80）");
+  Serial.println("[Web] 服务器已启动（端口80）");
 
   Serial.println("========================");
   Serial.print  (" VLC接收端（调试版）ROLE=");

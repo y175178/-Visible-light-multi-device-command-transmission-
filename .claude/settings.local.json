@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -v http://192.168.198.53:5000/ --connect-timeout 5)",
+      "Bash(netsh wlan *)",
+      "Bash(findstr \"SSID\")",
+      "Bash(xxd -r -p)",
+      "Bash(ping -n 2 192.168.198.53)",
+      "Bash(arp -a)",
+      "Bash(findstr \"192.168\")",
+      "Bash(ipconfig)",
+      "Bash(findstr /C:\"IPv4\")",
+      "Bash(curl -v --connect-timeout 3 http://192.168.198.53:5000/)",
+      "Bash(reg query *)"
+    ]
+  }
+}

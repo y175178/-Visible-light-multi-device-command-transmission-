@@ -88,6 +88,9 @@
                 <view class="receiver-status" :class="rx.state === 1 ? 'on' : 'off'">
                   {{ rx.state === 1 ? "✓ ON" : "✗ OFF" }}
                 </view>
+                <button class="btn-calibrate" @click="recalibrateReceiver(idx)" :disabled="!rx.ip.trim()">
+                  校准
+                </button>
               </view>
             </view>
           </view>
@@ -522,6 +525,33 @@ function syncAllReceivers(): void {
   receivers.value.forEach((_, index) => syncReceiverAck(index));
 }
 
+// 接收端阈值远程校准
+function recalibrateReceiver(rxIndex: number): void {
+  const rx = receivers.value[rxIndex];
+  if (!rx.ip.trim()) {
+    uni.showToast({ title: "请先配置接收端IP", icon: "none" });
+    return;
+  }
+
+  addLog(`发送阈值校准命令到 ${rx.name}...`, "info");
+  uni.showToast({ title: `${rx.name} 校准中...`, icon: "loading" });
+
+  uni.request({
+    method: "GET",
+    url: rxBase(rx.ip) + "/recalibrate",
+    timeout: 15000,
+    success: (res: any) => {
+      const data = parseResponseData(res.data);
+      addLog(`${rx.name} 校准完成, 新阈值: ${data.threshold}`, "success");
+      uni.showToast({ title: `${rx.name} 校准完成, 阈值: ${data.threshold}`, icon: "none" });
+    },
+    fail: (err: any) => {
+      addLog(`${rx.name} 校准失败: ${JSON.stringify(err)}`, "error");
+      uni.showToast({ title: `${rx.name} 校准失败`, icon: "none" });
+    }
+  });
+}
+
 // 设备控制
 function setDeviceState(device: string, state: number): void {
   if (!txConnected.value) {
@@ -843,6 +873,27 @@ onHide(() => {
 .receiver-status.off {
   background: rgba(239, 68, 68, 0.2);
   color: var(--error-color);
+}
+
+.btn-calibrate {
+  background: rgba(245, 158, 11, 0.1);
+  color: var(--warning-color);
+  border: 1rpx solid rgba(245, 158, 11, 0.3);
+  border-radius: 8rpx;
+  padding: 6rpx 12rpx;
+  font-size: 18rpx;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.btn-calibrate:active {
+  background: var(--warning-color);
+  color: #ffffff;
+}
+
+.btn-calibrate:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 /* ===== 按钮样式 ===== */
