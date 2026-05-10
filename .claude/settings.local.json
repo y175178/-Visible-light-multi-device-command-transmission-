@@ -11,7 +11,9 @@
       "Bash(ipconfig)",
       "Bash(findstr /C:\"IPv4\")",
       "Bash(curl -v --connect-timeout 3 http://192.168.198.53:5000/)",
-      "Bash(reg query *)"
+      "Bash(reg query *)",
+      "Bash(grep -n \"rawMode\\\\|raw模式\\\\|Raw模式\\\\|RAW\\\\|sendRaw\\\\|raw\" \"c:\\\\\\\\Users\\\\\\\\ycq\\\\\\\\Desktop\\\\\\\\esp32\\\\\\\\vlc\\\\\\\\src\\\\\\\\main.cpp\")",
+      "Bash(grep -n \"rawMode\\\\|raw模式\\\\|Raw模式\\\\|RAW\\\\|raw\" \"c:\\\\\\\\Users\\\\\\\\ycq\\\\\\\\Desktop\\\\\\\\esp32\\\\\\\\vlc\\\\\\\\receiver_role_esp8266\\\\\\\\receiver_role_esp8266.ino\")"
     ]
   }
 }

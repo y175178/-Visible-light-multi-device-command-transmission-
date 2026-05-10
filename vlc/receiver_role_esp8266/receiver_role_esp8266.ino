@@ -48,6 +48,9 @@ bool wifiUploading      = false;
 unsigned long lastUploadTime = 0;
 const unsigned long UPLOAD_COOLDOWN = 100;
 
+// ==================== Raw模式（误码率测试） ====================
+bool rawMode = false;  // true: 只收原始数据位，无前导码/CRC/帧尾
+
 // ==================== 调试开关 ====================
 bool debugSignal     = false;
 bool continuousDebug = false;
@@ -121,7 +124,7 @@ void applyCommand(const String& cmd) {
 //  曼彻斯特解码状态机
 // ============================================================
 enum RxState { WAIT_PREAMBLE, READ_LEN, READ_PAYLOAD, READ_END };
-RxState rxState = WAIT_PREAMBLE;
+RxState rxState = READ_LEN;  // NRZ模式，直接接收帧字节
 
 uint32_t shiftReg = 0;
 const uint32_t PREAMBLE_MASK  = 0x01FFFFFF;
@@ -147,7 +150,7 @@ uint8_t asciiCrc    = 0;
 //  复位状态机
 // ============================================================
 void resetRx() {
-  rxState      = WAIT_PREAMBLE;
+  rxState      = READ_LEN;  // NRZ模式无前导码，直接等帧类型/长度字节
   shiftReg     = 0;
   rxByte       = 0;
   rxBitCount   = 0;
@@ -491,6 +494,7 @@ void printHelp() {
   Serial.println("  reset 重置误码率统计");
   Serial.println("  thr   手动输入阈值");
   Serial.println("  cal   重新自动校准阈值");
+  Serial.println("  raw   切换Raw模式（误码率测试，无帧结构）");
   Serial.println("  info  显示当前状态");
   Serial.println("  help  显示本菜单");
   Serial.println("==============================\n");
@@ -585,6 +589,7 @@ void loop() {
     if      (s == "d1")    { debugSignal = true;  continuousDebug = false; Serial.println("调试开（300ms）"); }
     else if (s == "d2")    { debugSignal = true;  continuousDebug = true;  Serial.println("调试开（连续）"); }
     else if (s == "d0")    { debugSignal = false; continuousDebug = false; Serial.println("调试关"); }
+    else if (s == "raw")   { rawMode = !rawMode; Serial.print("[Raw模式] "); Serial.println(rawMode ? "开启 — 只收原始数据位" : "关闭 — 恢复帧解析"); }
     else if (s == "cal")   { adcThreshold = autoCalibrate(); }
     else if (s == "thr")   { manualSetThreshold(); }
     else if (s == "reset") {
@@ -592,14 +597,20 @@ void loop() {
       Serial.println("[BER] 统计已重置");
     }
     else if (s == "ber") {
-      uint32_t total = statTotalRecv + statCrcFail;
-      float crcRate  = (total > 0) ? (float)statCrcFail / total * 100.0f : 0.0f;
       Serial.println("\n===== 本机误码统计 =====");
-      Serial.print("总收帧:      "); Serial.println(total);
-      Serial.print("CRC通过:     "); Serial.println(statTotalRecv);
-      Serial.print("CRC失败:     "); Serial.println(statCrcFail);
-      Serial.print("CRC失败率:   "); Serial.print(crcRate, 2); Serial.println("%");
-      Serial.print("帧结构错误:  "); Serial.println(statFrameError);
+      if (rawMode) {
+        Serial.println("[模式] Raw（无帧结构）");
+        Serial.print("收到原始字节: "); Serial.println(statTotalRecv);
+        Serial.print("噪声复位次数: "); Serial.println(statFrameError);
+      } else {
+        uint32_t total = statTotalRecv + statCrcFail;
+        float crcRate  = (total > 0) ? (float)statCrcFail / total * 100.0f : 0.0f;
+        Serial.print("总收帧:      "); Serial.println(total);
+        Serial.print("CRC通过:     "); Serial.println(statTotalRecv);
+        Serial.print("CRC失败:     "); Serial.println(statCrcFail);
+        Serial.print("CRC失败率:   "); Serial.print(crcRate, 2); Serial.println("%");
+        Serial.print("帧结构错误:  "); Serial.println(statFrameError);
+      }
       Serial.print("ADC阈值:     "); Serial.println(adcThreshold);
       Serial.println("========================\n");
     }
@@ -608,6 +619,11 @@ void loop() {
       Serial.print("上次指令: "); Serial.println(lastCommand);
       Serial.print("ADC阈值: "); Serial.println(adcThreshold);
       Serial.print("A0当前值: "); Serial.println(analogRead(signalPin));
+      Serial.print("Raw模式: "); Serial.println(rawMode ? "开启（无帧结构）" : "关闭");
+      if (rawMode) {
+        Serial.print("Raw接收字节: "); Serial.println(statTotalRecv);
+        Serial.print("Raw噪声复位: "); Serial.println(statFrameError);
+      }
     }
     else if (s == "help") { printHelp(); }
     else { Serial.println("未知命令，输入 help"); }
@@ -637,32 +653,71 @@ void loop() {
   if (now - lastSample < (unsigned long)BIT_PERIOD_US) return;
   lastSample = now;
 
-  int val1 = analogRead(signalPin);
-  delayMicroseconds(BIT_PERIOD_US / 2);
-  int val2 = analogRead(signalPin);
+  // ---- 统一NRZ字节检测（raw模式 + 正常模式） ----
+  {
+    static bool nrzPrevHigh = false;
+    static enum { NRZ_IDLE, NRZ_WAIT_FALL, NRZ_DATA } nrzState = NRZ_IDLE;
+    static int  nrzBitIdx = 0;
+    static uint8_t nrzByte = 0;
+    // raw模式专用
+    static String rawAccum = "";
+    static unsigned long rawLastByteMs = 0;
+    static uint8_t  rawPrevByte = 0;
 
-  bool bit;
-  if      (val1 >  adcThreshold && val2 <= adcThreshold) bit = 1;
-  else if (val1 <= adcThreshold && val2 >  adcThreshold) bit = 0;
-  else    bit = 0;
+    int v = analogRead(signalPin);
+    bool high = (v > adcThreshold);
 
-  // 前导码检测
-  if (rxState == WAIT_PREAMBLE) {
-    shiftReg = ((shiftReg << 1) | (bit ? 1 : 0)) & PREAMBLE_MASK;
-    if (shiftReg == PREAMBLE_VALUE) {
-      rxState    = READ_LEN;
-      rxBitCount = 0;
-      rxByte     = 0;
+    // raw模式：空闲超时 → 输出拼接字符串
+    if (rawMode && nrzState == NRZ_IDLE && rawAccum.length() > 0 && (millis() - rawLastByteMs > 80)) {
+      Serial.print("[RAW STR] \"");
+      Serial.print(rawAccum);
+      Serial.println("\"");
+      rawAccum = "";
     }
-    return;
-  }
 
-  // 字节级收集
-  rxByte = (rxByte << 1) | (bit ? 1 : 0);
-  rxBitCount++;
-  if (rxBitCount == 8) {
-    processByte(rxByte);
-    rxBitCount = 0;
-    rxByte     = 0;
+    switch (nrzState) {
+    case NRZ_IDLE:
+      if (!nrzPrevHigh && high) {
+        nrzState = NRZ_WAIT_FALL;
+      }
+      break;
+    case NRZ_WAIT_FALL:
+      if (nrzPrevHigh && !high) {
+        nrzState  = NRZ_DATA;
+        nrzBitIdx = 0;
+        nrzByte   = 0;
+      }
+      break;
+    case NRZ_DATA:
+      nrzByte = (nrzByte << 1) | (high ? 1 : 0);
+      nrzBitIdx++;
+      if (nrzBitIdx == 8) {
+        if (rawMode) {
+          // Raw模式：直接打印
+          Serial.print("[RAW] b");
+          for (int b = 7; b >= 0; b--) Serial.print((nrzByte >> b) & 1);
+          if (nrzByte >= 0x20 && nrzByte <= 0x7E) {
+            Serial.print(" '");
+            Serial.print((char)nrzByte);
+            Serial.print("'");
+          }
+          Serial.println();
+          statTotalRecv++;
+          bool isDup = (nrzByte == rawPrevByte && (millis() - rawLastByteMs) < 30 && rawAccum.length() > 0);
+          if (!isDup) {
+            rawAccum += (char)nrzByte;
+            rawLastByteMs = millis();
+          }
+          rawPrevByte = nrzByte;
+        } else {
+          // 正常模式：喂给帧解析器
+          processByte(nrzByte);
+        }
+        nrzState = NRZ_IDLE;
+      }
+      break;
+    }
+    nrzPrevHigh = high;
+    return;
   }
 }

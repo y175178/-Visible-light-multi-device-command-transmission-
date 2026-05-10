@@ -15,6 +15,7 @@ const int ledPin = 16;
 // ==================== 通信参数 ====================
 const int BIT_PERIOD_US = 1000;  // 1kbps
 const int FRAME_REPEAT  = 2;     // 每条指令重复发送次数
+const int RAW_REPEAT    = 1;     // Raw模式重复次数（测误码率不重复）
 const int FRAME_GAP_MS  = 12;    // 两帧间隔
 
 // ==================== 帧类型 ====================
@@ -54,6 +55,9 @@ String pendingCommand = "";
 uint32_t statTotalSent    = 0;   // 总发送帧数
 uint32_t statTotalRecv    = 0;   // 接收端确认收到帧数（由/ber_ack更新）
 uint32_t statCrcFail      = 0;   // 接收端CRC失败帧数（由/ber_ack更新）
+
+// ==================== Raw模式（误码率测试） ====================
+bool rawMode = false;  // true: 只发原始数据位，无前导码/CRC/帧尾
 
 // ==================== 自动测试模式 ====================
 bool     autoTestMode     = false;
@@ -99,43 +103,75 @@ void sendByte(uint8_t b) {
 }
 
 // ============================================================
-//  发送定长短码帧（用于固定6条指令）
+//  发送NRZ字节（通用，带起始标记）
+//  格式：[OFF 3ms] [ON 2ms] [OFF 1ms] [8bit NRZ]
+//  接收端检测 ON→OFF 下降沿后，下一个采样点即为 data[7]
+// ============================================================
+void sendNrzByte(uint8_t b) {
+  digitalWrite(ledPin, LOW);
+  delayMicroseconds(3000);
+  digitalWrite(ledPin, HIGH);     // ON脉冲 2ms
+  delayMicroseconds(2000);
+  digitalWrite(ledPin, LOW);      // OFF间隙 1ms（产生下降沿）
+  delayMicroseconds(BIT_PERIOD_US);
+  for (int i = 7; i >= 0; i--) {
+    digitalWrite(ledPin, (b >> i) & 1 ? HIGH : LOW);
+    delayMicroseconds(BIT_PERIOD_US);
+  }
+  digitalWrite(ledPin, LOW);
+}
+
+// ============================================================
+//  发送定长短码帧（NRZ编码，无前导码）
+//  帧格式：[0xBB] [code] [CRC] [0xFF]  每字节独立NRZ发送
 // ============================================================
 void sendShortFrame(uint8_t code) {
   uint8_t crc = crc8(&code, 1);
   for (int n = 0; n < FRAME_REPEAT; n++) {
-    for (int i = 0; i < 25; i++) sendBit(1);  // 前导码
-    sendByte(FRAME_TYPE_SHORT);                // 帧类型
-    sendByte(code);                            // 指令码
-    sendByte(crc);                             // CRC
-    sendByte(FRAME_END);                       // 帧尾
+    sendNrzByte(FRAME_TYPE_SHORT);  // 帧类型 0xBB
+    delay(2);
+    sendNrzByte(code);              // 指令码
+    delay(2);
+    sendNrzByte(crc);               // CRC
+    delay(2);
+    sendNrzByte(FRAME_END);         // 帧尾 0xFF
     delay(FRAME_GAP_MS);
   }
-  digitalWrite(ledPin, LOW);
+  statTotalSent++;
+}
+
+// 发送NRZ原始字节（用于误码率测试，单个字节）
+void sendRawByte(uint8_t code) {
+  for (int n = 0; n < RAW_REPEAT; n++) {
+    sendNrzByte(code);
+    delay(FRAME_GAP_MS);
+  }
   statTotalSent++;
 }
 
 // ============================================================
-//  发送ASCII帧（用于任意字符串，调试模式）
-//  帧结构：[25bit前导] [长度] [字符串bytes] [CRC] [0xFF]
+//  发送ASCII帧（NRZ编码，无前导码）
+//  帧格式：[len] [字符串bytes] [CRC] [0xFF]  每字节独立NRZ发送
 // ============================================================
 void sendAsciiFrame(const String& msg) {
   uint8_t len = (uint8_t)msg.length();
-  // 计算CRC：对长度+内容做校验
   uint8_t buf[65];
   buf[0] = len;
   for (int i = 0; i < len; i++) buf[i + 1] = (uint8_t)msg[i];
   uint8_t crc = crc8(buf, len + 1);
 
   for (int n = 0; n < FRAME_REPEAT; n++) {
-    for (int i = 0; i < 25; i++) sendBit(1);  // 前导码
-    sendByte(len);                             // 帧类型/长度（非0xBB即ASCII帧）
-    for (char c : msg) sendByte((uint8_t)c);  // 内容
-    sendByte(crc);                             // CRC（新增）
-    sendByte(FRAME_END);                       // 帧尾
+    sendNrzByte(len);               // 长度
+    delay(2);
+    for (char c : msg) {
+      sendNrzByte((uint8_t)c);      // 内容
+      delay(2);
+    }
+    sendNrzByte(crc);               // CRC
+    delay(2);
+    sendNrzByte(FRAME_END);         // 帧尾
     delay(FRAME_GAP_MS);
   }
-  digitalWrite(ledPin, LOW);
   statTotalSent++;
 }
 
@@ -144,6 +180,29 @@ void sendAsciiFrame(const String& msg) {
 // ============================================================
 void applyCommand(const String& command) {
   Serial.print("[发送] "); Serial.println(command);
+
+  // ---- Raw模式：只发原始数据位，无帧结构 ----
+  if (rawMode) {
+    int idx = -1;
+    for (int i = 0; i < SHORT_TABLE_SIZE; i++) {
+      if (command == SHORT_TABLE[i].cmd) { idx = i; break; }
+    }
+    if (idx >= 0) {
+      Serial.print("[Raw] 短码="); Serial.println(SHORT_TABLE[idx].code);
+      sendRawByte(SHORT_TABLE[idx].code);
+    } else {
+      // 任意字符串：逐字节发送（每个字节独立发）
+      Serial.print("[Raw] ASCII逐字节: ");
+      for (int i = 0; i < (int)command.length(); i++) {
+        if (i > 0) delay(FRAME_GAP_MS * 2);
+        sendRawByte((uint8_t)command[i]);
+        Serial.print(command[i]);
+      }
+      Serial.println();
+    }
+    Serial.println("[Raw发送完成] ----------------");
+    return;
+  }
 
   // 更新预期状态
   if      (command == "LIGHT_ON")  expectedLightState = "1";
@@ -394,6 +453,7 @@ void printHelp() {
   Serial.println("  auto N CMD [interval]→ 自动发送CMD共N次，间隔Xms（默认500ms）");
   Serial.println("    例：auto 100 LIGHT_ON 300");
   Serial.println("  stop                 → 停止自动测试");
+  Serial.println("  raw                  → 切换Raw模式（误码率测试，无帧结构）");
   Serial.println("  help                 → 显示本菜单");
   Serial.println("==============================\n");
 }
@@ -488,6 +548,13 @@ void loop() {
     }
 
     if (inputUpper == "HELP") { printHelp(); return; }
+
+    if (inputUpper == "RAW") {
+      rawMode = !rawMode;
+      Serial.print("[Raw模式] ");
+      Serial.println(rawMode ? "开启 — 只发原始数据位（无前导码/CRC/帧尾）" : "关闭 — 恢复完整帧");
+      return;
+    }
 
     // ---- 自动测试：auto N CMD [interval] ----
     if (inputUpper.startsWith("AUTO ")) {
