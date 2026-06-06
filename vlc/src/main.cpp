@@ -589,8 +589,14 @@ void loop() {
     }
 
     // ---- 普通发送：任意字符串 ----
-    inputUpper.trim();
-    applyCommand(inputUpper);
+    // raw模式保留原始大小写，正常模式转大写匹配指令
+    if (rawMode) {
+      input.trim();
+      applyCommand(input);
+    } else {
+      inputUpper.trim();
+      applyCommand(inputUpper);
+    }
 
     Serial.flush();
     delay(200);

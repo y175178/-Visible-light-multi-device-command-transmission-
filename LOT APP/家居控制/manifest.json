@@ -86,6 +86,12 @@
 	"app-android": {
 		"distribute": {
 			"modules": {},
+			"android": {
+				"keystore": "test.keystore",
+				"keystorePassword": "123456",
+				"keyAlias": "test",
+				"keyPassword": "123456"
+			},
 			"icons": {
 				"hdpi": "",
 				"xhdpi": "",
@@ -96,8 +102,13 @@
 				"default": {}
 			},
 			"abiFilters": [
-				"x86_64"
-			]
+				"x86_64",
+				"arm64-v8a",
+				"x86",
+				"armeabi-v7a"
+			],
+			"targetSdkVersion": "35",
+			"schemes": "myapp,helloapp"
 		}
 	},
 	"app-ios": {
@@ -110,10 +121,13 @@
 	"web": {
 		"router": {
 			"mode": "",
-			"base": ""
+			"base": "./"
 		},
 		"devServer": {
 			"https": false
+		},
+		"unipush": {
+			"enable": false
 		}
 	}
 }

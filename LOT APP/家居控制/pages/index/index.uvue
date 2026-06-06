@@ -1,4 +1,4 @@
-﻿<template>
+<template>
   <view class="page">
     <!-- 顶部导航栏 -->
     <view class="header-bar">
@@ -88,9 +88,6 @@
                 <view class="receiver-status" :class="rx.state === 1 ? 'on' : 'off'">
                   {{ rx.state === 1 ? "✓ ON" : "✗ OFF" }}
                 </view>
-                <button class="btn-calibrate" @click="recalibrateReceiver(idx)" :disabled="!rx.ip.trim()">
-                  校准
-                </button>
               </view>
             </view>
           </view>
@@ -107,8 +104,38 @@
 import { onMounted, onUnmounted, reactive, ref } from "vue";
 import { onHide } from "@dcloudio/uni-app";
 
-// 主要状态
-const timer = ref<number | null>(null);
+// ========== 类型定义 ==========
+type ReceiverItem = {
+  id: number,
+  name: string,
+  device: string,
+  ip: string,
+  message: string,
+  connected: boolean,
+  state: number
+}
+
+type LogEntry = {
+  time: string,
+  message: string,
+  type: string
+}
+
+type DeviceStatus = {
+  light: number,
+  servo: number,
+  fan: number
+}
+
+type StatsData = {
+  totalRequests: number,
+  successCount: number,
+  failCount: number,
+  successRate: number
+}
+
+// ========== 状态 ==========
+const timer = ref<number>(0);
 
 // 发射端配置
 const txIp = ref("");
@@ -118,15 +145,15 @@ const txMessage = ref("未连接");
 const txError = ref("");
 
 // 设备状态
-const deviceStatus = reactive({
+const deviceStatus = reactive<DeviceStatus>({
   light: 0,
   servo: 0,
   fan: 0
 });
 
 const commandSending = ref(false);
-const debugLogs = ref<Array<{ time: string; message: string; type: string }>>([]);
-const stats = reactive({
+const debugLogs = ref<Array<LogEntry>>([]);
+const stats = reactive<StatsData>({
   totalRequests: 0,
   successCount: 0,
   failCount: 0,
@@ -134,63 +161,177 @@ const stats = reactive({
 });
 
 // 接收端配置
-const receivers = ref<Array<{ id: number; name: string; device: string; ip: string; message: string; connected: boolean; state: number }>>([
+const receivers = ref<Array<ReceiverItem>>([
   { id: 1, name: "灯", device: "LIGHT", ip: "", message: "未配置IP", connected: false, state: 0 },
   { id: 2, name: "舵机", device: "SERVO", ip: "", message: "未配置IP", connected: false, state: 0 }
 ]);
 
+// ========== 工具函数 ==========
+function pad2(n: number): string {
+  if (n < 10) return "0" + n.toString();
+  return n.toString();
+}
+
+function getFormattedTime(): string {
+  const now = new Date();
+  return pad2(now.getHours()) + ":" + pad2(now.getMinutes()) + ":" + pad2(now.getSeconds());
+}
+
+function addLog(message: string, type: string = "info"): void {
+  const entry: LogEntry = { time: getFormattedTime(), message: message, type: type };
+  const arr = debugLogs.value;
+  arr.push(entry);
+  if (arr.length > 50) {
+    arr.splice(0, 1);
+  }
+  debugLogs.value = arr;
+}
+
+function updateStats(success: boolean): void {
+  stats.totalRequests = stats.totalRequests + 1;
+  if (success) {
+    stats.successCount = stats.successCount + 1;
+  } else {
+    stats.failCount = stats.failCount + 1;
+  }
+  if (stats.totalRequests > 0) {
+    stats.successRate = Math.round((stats.successCount / stats.totalRequests) * 100);
+  } else {
+    stats.successRate = 0;
+  }
+}
+
+function parseResponseData(raw: any): any {
+  if (typeof raw === "string") {
+    const normalized = raw.replace(/'/g, "\"");
+    try {
+      return JSON.parse(normalized) ?? {};
+    } catch (e) {
+      const empty: any = {};
+      return empty;
+    }
+  }
+  if (raw != null) return raw;
+  const empty: any = {};
+  return empty;
+}
+
+function normalizeHost(host: string, defaultPort: string): string {
+  let h = host.trim();
+  if (h.startsWith("http://")) h = h.substring(7);
+  else if (h.startsWith("https://")) h = h.substring(8);
+  if (h.endsWith("/")) h = h.substring(0, h.length - 1);
+  if (h.includes("/")) h = h.split("/")[0];
+  if (h.length > 0 && !h.includes(":")) h = h + ":" + defaultPort;
+  return h;
+}
+
+function txBase(): string {
+  return "http://" + normalizeHost(txIp.value, "5000");
+}
+
+function rxBase(ip: string): string {
+  return "http://" + normalizeHost(ip, "80");
+}
+
+function getReceiverIcon(device: string): string {
+  if (device === "LIGHT") return "💡";
+  if (device === "SERVO") return "🎚️";
+  if (device === "FAN") return "🌀";
+  return "📦";
+}
+
+function validateIp(ip: string): boolean {
+  if (ip.length == 0 || ip.trim().length == 0) return true;
+  const trimmed = ip.trim();
+  const parts = trimmed.split(':');
+  if (parts.length > 2) return false;
+  const ipPart = parts[0];
+  if (parts.length > 1) {
+    const portPart = parts[1];
+    const port = parseInt(portPart);
+    if (isNaN(port) || port < 1 || port > 65535) return false;
+  }
+  const segs = ipPart.split('.');
+  if (segs.length != 4) return false;
+  for (let i = 0; i < 4; i++) {
+    const num = parseInt(segs[i]);
+    if (isNaN(num) || num < 0 || num > 255) return false;
+  }
+  return true;
+}
+
+// ========== 本地存储管理 ==========
 function saveStateCache(): void {
   try {
-    uni.setStorageSync("deviceStatusCache", JSON.stringify({
-      light: deviceStatus.light,
-      servo: deviceStatus.servo,
-      fan: deviceStatus.fan
-    }));
-    uni.setStorageSync("receiverStateCache", JSON.stringify(
-      receivers.value.map((rx) => ({ device: rx.device, state: rx.state }))
-    ));
+    const statusMap: any = { light: deviceStatus.light, servo: deviceStatus.servo, fan: deviceStatus.fan };
+    uni.setStorageSync("deviceStatusCache", JSON.stringify(statusMap));
+    const rxArr: Array<any> = [];
+    const list = receivers.value;
+    for (let i = 0; i < list.length; i++) {
+      rxArr.push({ device: list[i].device, state: list[i].state });
+    }
+    uni.setStorageSync("receiverStateCache", JSON.stringify(rxArr));
   } catch (e) {
     addLog("保存状态缓存失败", "error");
   }
 }
 
-// 本地存储管理
 function loadSettings(): void {
   try {
-    const savedTxIp = uni.getStorageSync("txIp");
-    if (savedTxIp) {
+    // 1. 修复发送端IP
+    const savedTxIp: string = uni.getStorageSync("txIp") as string ?? "";
+    if (savedTxIp != "") {
       txIp.value = savedTxIp;
     }
+
+    // 2. 修复接收端IP列表 ✅ 解决 ip 找不到报错
+    const savedReceivers: string = uni.getStorageSync("receivers") as string ?? "[]";
+    if (savedReceivers != "") {
+      const parsed: UTSArray<any> = JSON.parse(savedReceivers) as UTSArray<any> ?? [];
+      const list = receivers.value;
+      
+      for (let i = 0; i < list.size; i++) {
+        // 方括号访问属性，UTS强制要求
+        if (i < parsed.size && parsed[i] != null && parsed[i]['ip'] != null) {
+          list[i]['ip'] = parsed[i]['ip'] as string;
+        }
+      }
+      receivers.value = list;
+    }
+
+    // 3. 修复设备状态缓存 ✅ 解决 light/servo/fan 找不到报错
+    const savedStatus: string = uni.getStorageSync("deviceStatusCache") as string ?? "{}";
+    if (savedStatus != "") {
+      const parsedStatus: any = JSON.parse(savedStatus) ?? {};
+      
+      const lv: any = parsedStatus['light'];
+      deviceStatus['light'] = (lv == 1) ? 1 : 0;
+      const sv: any = parsedStatus['servo'];
+      deviceStatus['servo'] = (sv == 1) ? 1 : 0;
+      const fv: any = parsedStatus['fan'];
+      deviceStatus['fan'] = (fv == 1) ? 1 : 0;
+    }
+
+    // 4. 修复接收端状态缓存 ✅ 解决 device/state 找不到报错
+    const savedReceiverState: string = uni.getStorageSync("receiverStateCache") as string ?? "[]";
+    if (savedReceiverState != "") {
+      const parsedReceiverState: UTSArray<any> = JSON.parse(savedReceiverState) as UTSArray<any> ?? [];
+      const list2 = receivers.value;
+      
+      for (let i = 0; i < list2.size; i++) {
+        const rdev: string = list2[i]['device'] as string;
+        for (let j = 0; j < parsedReceiverState.size; j++) {
+          if (parsedReceiverState[j] != null && parsedReceiverState[j]['device'] === rdev) {
+            const st: any = parsedReceiverState[j]['state'];
+            list2[i]['state'] = (st == 1) ? 1 : 0;
+            break;
+          }
+        }
+      }
+      receivers.value = list2;
+    }
     
-    const savedReceivers = uni.getStorageSync("receivers");
-    if (savedReceivers) {
-      const parsed = JSON.parse(savedReceivers);
-      // 只更新IP地址，保持其他属性不变
-      receivers.value.forEach((rx, index) => {
-        if (parsed[index] && parsed[index].ip) {
-          rx.ip = parsed[index].ip;
-        }
-      });
-    }
-
-    const savedStatus = uni.getStorageSync("deviceStatusCache");
-    if (savedStatus) {
-      const parsedStatus = JSON.parse(savedStatus);
-      deviceStatus.light = Number(parsedStatus.light ?? deviceStatus.light) === 1 ? 1 : 0;
-      deviceStatus.servo = Number(parsedStatus.servo ?? deviceStatus.servo) === 1 ? 1 : 0;
-      deviceStatus.fan = Number(parsedStatus.fan ?? deviceStatus.fan) === 1 ? 1 : 0;
-    }
-
-    const savedReceiverState = uni.getStorageSync("receiverStateCache");
-    if (savedReceiverState) {
-      const parsedReceiverState = JSON.parse(savedReceiverState);
-      receivers.value.forEach((rx) => {
-        const matched = parsedReceiverState.find((x: any) => x.device === rx.device);
-        if (matched) {
-          rx.state = Number(matched.state ?? rx.state) === 1 ? 1 : 0;
-        }
-      });
-    }
   } catch (e) {
     addLog("加载设置失败", "error");
   }
@@ -211,15 +352,15 @@ function saveTxIp(): void {
 
 function saveReceivers(): void {
   let hasInvalid = false;
-  receivers.value.forEach(rx => {
-    if (rx.ip.trim() && !validateIp(rx.ip)) {
+  const list = receivers.value;
+  for (let i = 0; i < list.length; i++) {
+    const rx = list[i];
+    if (rx.ip.trim().length > 0 && !validateIp(rx.ip)) {
       hasInvalid = true;
-      uni.showToast({ title: `${rx.name} IP格式不正确`, icon: "none" });
+      uni.showToast({ title: rx.name + " IP格式不正确", icon: "none" });
     }
-  });
-  
+  }
   if (hasInvalid) return;
-  
   try {
     uni.setStorageSync("receivers", JSON.stringify(receivers.value));
     addLog("接收端配置已保存", "info");
@@ -234,168 +375,7 @@ function persistPageState(): void {
   saveReceivers();
 }
 
-function validateIp(ip: string): boolean {
-  if (!ip || !ip.trim()) return true; // 允许空值
-  
-  const trimmed = ip.trim();
-  
-  // 检查是否包含端口
-  const parts = trimmed.split(':');
-  if (parts.length > 2) return false;
-  
-  const ipPart = parts[0];
-  const portPart = parts[1];
-  
-  // 检查IP地址格式
-  const ipRegex = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
-  const match = ipPart.match(ipRegex);
-  if (!match) return false;
-  
-  // 检查每个部分是否在0-255范围内
-  for (let i = 1; i <= 4; i++) {
-    const num = parseInt(match[i]);
-    if (num < 0 || num > 255) return false;
-  }
-  
-  // 检查端口（如果有的话）
-  if (portPart) {
-    const port = parseInt(portPart);
-    if (isNaN(port) || port < 1 || port > 65535) return false;
-  }
-  
-  return true;
-}
-
-// 工具函数
-function parseResponseData(raw: any): any {
-  if (typeof raw === "string") {
-    const normalized = raw.replace(/'/g, "\"");
-    try {
-      return JSON.parse(normalized);
-    } catch (e) {
-      return {};
-    }
-  }
-  return raw ?? {};
-}
-
-function normalizeHost(host: string, defaultPort: string): string {
-  let h = host.trim();
-  if (h.startsWith("http://")) h = h.substring(7);
-  else if (h.startsWith("https://")) h = h.substring(8);
-  if (h.endsWith("/")) h = h.slice(0, -1);
-  if (h.includes("/")) h = h.split("/")[0];
-  if (h.length > 0 && !h.includes(":")) h = h + ":" + defaultPort;
-  return h;
-}
-
-function getFormattedTime(): string {
-  const now = new Date();
-  const hours = String(now.getHours()).padStart(2, "0");
-  const minutes = String(now.getMinutes()).padStart(2, "0");
-  const seconds = String(now.getSeconds()).padStart(2, "0");
-  return `${hours}:${minutes}:${seconds}`;
-}
-
-function txBase(): string {
-  return "http://" + normalizeHost(txIp.value, "5000");
-}
-
-function rxBase(ip: string): string {
-  return "http://" + normalizeHost(ip, "80");
-}
-
-function getReceiverIcon(device: string): string {
-  if (device === "LIGHT") return "💡";
-  if (device === "SERVO") return "🎚️";
-  if (device === "FAN") return "🌀";
-  return "📦";
-}
-
-function addLog(message: string, type: string = "info"): void {
-  const time = getFormattedTime();
-  debugLogs.value.push({ time, message, type });
-  if (debugLogs.value.length > 50) {
-    debugLogs.value.shift();
-  }
-}
-
-function updateStats(success: boolean): void {
-  stats.totalRequests++;
-  if (success) {
-    stats.successCount++;
-  } else {
-    stats.failCount++;
-  }
-  stats.successRate = stats.totalRequests > 0 ? Math.round((stats.successCount / stats.totalRequests) * 100) : 0;
-}
-
-// UI交互
-function validateTxIp(): void {
-  const ip = txIp.value.trim();
-  if (ip.length === 0) {
-    txError.value = "IP地址不能为空";
-  } else {
-    txError.value = "";
-  }
-}
-
-function testConnection(): void {
-  addLog("开始测试网络连接...", "info");
-  
-  // 检查网络状态
-  uni.getNetworkType({
-    success: (res) => {
-      addLog(`网络类型: ${res.networkType}, 连接状态: ${res.isConnected ? '已连接' : '未连接'}`, "info");
-    },
-    fail: (err) => {
-      addLog(`获取网络状态失败: ${JSON.stringify(err)}`, "error");
-    }
-  });
-  
-  // 测试发射端连接
-  if (txIp.value.trim()) {
-    uni.request({
-      method: "GET",
-      url: txBase() + "/status",
-      timeout: 5000,
-      success: (res: any) => {
-        addLog(`发射端连接成功: ${JSON.stringify(res)}`, "success");
-        uni.showToast({ title: "发射端连接成功", icon: "none" });
-      },
-      fail: (err: any) => {
-        addLog(`发射端连接失败: ${JSON.stringify(err)}`, "error");
-        uni.showToast({ title: "发射端连接失败", icon: "none" });
-      }
-    });
-  } else {
-    addLog("发射端IP未配置", "error");
-    uni.showToast({ title: "请先配置发射端IP", icon: "none" });
-  }
-  
-  // 测试接收端连接
-  receivers.value.forEach((rx) => {
-    if (rx.ip.trim()) {
-      uni.request({
-        method: "GET",
-        url: rxBase(rx.ip) + "/ack",
-        timeout: 5000,
-        success: (res: any) => {
-          addLog(`接收端 ${rx.name} 连接成功: ${JSON.stringify(res)}`, "success");
-          uni.showToast({ title: `${rx.name}连接成功`, icon: "none" });
-        },
-        fail: (err: any) => {
-          addLog(`接收端 ${rx.name} 连接失败: ${JSON.stringify(err)}`, "error");
-          uni.showToast({ title: `${rx.name}连接失败`, icon: "none" });
-        }
-      });
-    } else {
-      addLog(`接收端 ${rx.name} IP未配置`, "error");
-    }
-  });
-}
-
-// 连接与同步
+// ========== 连接与同步 ==========
 function connectTx(): void {
   const host = normalizeHost(txIp.value, "5000");
   if (host.length === 0) {
@@ -407,15 +387,15 @@ function connectTx(): void {
   txConnecting.value = true;
   txError.value = "";
   txMessage.value = "连接中...";
-  addLog(`正在连接: ${host}`, "info");
+  addLog("正在连接: " + host, "info");
 
   uni.request({
     method: "GET",
     url: txBase() + "/status",
     timeout: 3000,
     success: (res: any) => {
-      addLog(`发射端响应: ${JSON.stringify(res.data)}`, "info");
-      const data = parseResponseData(res.data);
+      addLog("发射端响应: " + JSON.stringify(res.data), "info");
+      parseResponseData(res.data);
       txConnected.value = true;
       txConnecting.value = false;
       txMessage.value = "在线";
@@ -426,12 +406,12 @@ function connectTx(): void {
       syncAllReceivers();
     },
     fail: (err: any) => {
-      addLog(`发射端连接失败详情: ${JSON.stringify(err)}`, "error");
+      addLog("发射端连接失败详情: " + JSON.stringify(err), "error");
       txConnected.value = false;
       txConnecting.value = false;
       txMessage.value = "离线";
       txError.value = "无法连接";
-      addLog(`连接失败: ${err}`, "error");
+      addLog("连接失败", "error");
       uni.showToast({ title: "连接失败", icon: "none" });
       updateStats(false);
     }
@@ -439,44 +419,41 @@ function connectTx(): void {
 }
 
 function syncTx(): void {
-  if (!txIp.value.trim()) return;
+  if (txIp.value.trim().length == 0) return;
 
   uni.request({
     method: "GET",
     url: txBase() + "/status",
     timeout: 2000,
     success: (res: any) => {
-      const data = parseResponseData(res.data);
-      
-      // 处理新的状态格式
+      const data: any = parseResponseData(res.data);
       let light = 0, servo = 0, fan = 0;
-      
-      if (data.confirmed_state) {
-        // 新格式：返回 confirmed_state 和 expected_state
-        const confirmed = data.confirmed_state;
-        const expected = data.expected_state;
-        const syncStatus = data.sync_status;
-        
-        light = Number(confirmed.light ?? 0) === 1 ? 1 : 0;
-        servo = Number(confirmed.servo ?? 0) === 1 ? 1 : 0;
-        fan = Number(confirmed.fan ?? 0) === 1 ? 1 : 0;
-        
-        // 如果状态不一致，表示还在等待反馈
+
+      if (data.confirmed_state != null) {
+        const confirmed: any = data.confirmed_state;
+        const expected: any = data.expected_state;
+        const syncStatus: any = data.sync_status;
+
+        light = (confirmed.light == 1) ? 1 : 0;
+        servo = (confirmed.servo == 1) ? 1 : 0;
+        fan = (confirmed.fan == 1) ? 1 : 0;
+
         if (syncStatus === "waiting_feedback") {
-          addLog(`[等待反馈中] 已发送命令，预期状态: Light=${expected.light}, Servo=${expected.servo}, Fan=${expected.fan}`, "info");
+          addLog("[等待反馈中] 已发送命令，预期状态: Light=" + expected.light + ", Servo=" + expected.servo + ", Fan=" + expected.fan, "info");
         }
       } else {
-        // 旧格式兼容处理
-        light = Number(data.light ?? 0) === 1 ? 1 : 0;
-        servo = Number(data.servo ?? 0) === 1 ? 1 : 0;
-        fan = Number(data.fan ?? 0) === 1 ? 1 : 0;
+        light = (data.light == 1) ? 1 : 0;
+        servo = (data.servo == 1) ? 1 : 0;
+        fan = (data.fan == 1) ? 1 : 0;
       }
-      
-      receivers.value.forEach((rx) => {
-        if (rx.device === "LIGHT") rx.state = light;
-        else if (rx.device === "SERVO") rx.state = servo;
-        else if (rx.device === "FAN") rx.state = fan;
-      });
+
+      const list = receivers.value;
+      for (let i = 0; i < list.length; i++) {
+        if (list[i].device === "LIGHT") list[i].state = light;
+        else if (list[i].device === "SERVO") list[i].state = servo;
+        else if (list[i].device === "FAN") list[i].state = fan;
+      }
+      receivers.value = list;
       saveStateCache();
 
       txConnected.value = true;
@@ -492,10 +469,13 @@ function syncTx(): void {
 }
 
 function syncReceiverAck(rxIndex: number): void {
-  const rx = receivers.value[rxIndex];
+  const list = receivers.value;
+  const rx = list[rxIndex];
   if (rx.ip.trim().length === 0) {
     rx.connected = false;
     rx.message = "未填IP";
+    list[rxIndex] = rx;
+    receivers.value = list;
     return;
   }
 
@@ -504,55 +484,32 @@ function syncReceiverAck(rxIndex: number): void {
     url: rxBase(rx.ip) + "/ack",
     timeout: 2000,
     success: (res: any) => {
-      addLog(`接收端 ${rx.name} 响应: ${JSON.stringify(res.data)}`, "info");
-      
+      addLog("接收端 " + rx.name + " 响应: " + JSON.stringify(res.data), "info");
       rx.connected = true;
       rx.message = "在线";
-      
+      list[rxIndex] = rx;
+      receivers.value = list;
       updateStats(true);
     },
     fail: (err: any) => {
-      addLog(`接收端 ${rx.name} 连接失败: ${rx.ip}/ack`, "error");
+      addLog("接收端 " + rx.name + " 连接失败: " + rx.ip + "/ack", "error");
       rx.connected = false;
       rx.message = "离线";
-      // 网络异常时保留上一次状态，不在页面清零
+      list[rxIndex] = rx;
+      receivers.value = list;
       updateStats(false);
     }
   });
 }
 
 function syncAllReceivers(): void {
-  receivers.value.forEach((_, index) => syncReceiverAck(index));
-}
-
-// 接收端阈值远程校准
-function recalibrateReceiver(rxIndex: number): void {
-  const rx = receivers.value[rxIndex];
-  if (!rx.ip.trim()) {
-    uni.showToast({ title: "请先配置接收端IP", icon: "none" });
-    return;
+  const list = receivers.value;
+  for (let i = 0; i < list.length; i++) {
+    syncReceiverAck(i);
   }
-
-  addLog(`发送阈值校准命令到 ${rx.name}...`, "info");
-  uni.showToast({ title: `${rx.name} 校准中...`, icon: "loading" });
-
-  uni.request({
-    method: "GET",
-    url: rxBase(rx.ip) + "/recalibrate",
-    timeout: 15000,
-    success: (res: any) => {
-      const data = parseResponseData(res.data);
-      addLog(`${rx.name} 校准完成, 新阈值: ${data.threshold}`, "success");
-      uni.showToast({ title: `${rx.name} 校准完成, 阈值: ${data.threshold}`, icon: "none" });
-    },
-    fail: (err: any) => {
-      addLog(`${rx.name} 校准失败: ${JSON.stringify(err)}`, "error");
-      uni.showToast({ title: `${rx.name} 校准失败`, icon: "none" });
-    }
-  });
 }
 
-// 设备控制
+// ========== 设备控制 ==========
 function setDeviceState(device: string, state: number): void {
   if (!txConnected.value) {
     uni.showToast({ title: "请先连接发射端", icon: "none" });
@@ -571,35 +528,86 @@ function setDeviceState(device: string, state: number): void {
   }
 
   commandSending.value = true;
-  addLog(`发送: ${cmd}`, "info");
+  addLog("发送: " + cmd, "info");
 
   uni.request({
     method: "GET",
     url: txBase() + "/control?cmd=" + cmd,
-    timeout: 2000,  // 缩短到2秒
+    timeout: 2000,
     success: () => {
-      uni.vibrateShort();
-      addLog(`${cmd} 成功`, "success");
-      
-      // 只负责发送命令；状态显示仅由 /status 同步
+      addLog(cmd + " 成功", "success");
       commandSending.value = false;
       updateStats(true);
     },
     fail: (err: any) => {
       commandSending.value = false;
-      addLog(`${cmd} 失败: ${JSON.stringify(err)}`, "error");
+      addLog(cmd + " 失败: " + JSON.stringify(err), "error");
       uni.showToast({ title: "发送失败", icon: "none" });
       updateStats(false);
     }
   });
 }
 
-// 生命周期
+// ========== 测试连接 ==========
+function testConnection(): void {
+  addLog("开始测试网络连接...", "info");
+
+  uni.getNetworkType({
+    success: (res: any) => {
+      addLog("网络类型: " + res.networkType + ", 连接状态: " + (res.isConnected ? "已连接" : "未连接"), "info");
+    },
+    fail: (err: any) => {
+      addLog("获取网络状态失败: " + JSON.stringify(err), "error");
+    }
+  });
+
+  if (txIp.value.trim().length > 0) {
+    uni.request({
+      method: "GET",
+      url: txBase() + "/status",
+      timeout: 5000,
+      success: (res: any) => {
+        addLog("发射端连接成功: " + JSON.stringify(res), "success");
+        uni.showToast({ title: "发射端连接成功", icon: "none" });
+      },
+      fail: (err: any) => {
+        addLog("发射端连接失败: " + JSON.stringify(err), "error");
+        uni.showToast({ title: "发射端连接失败", icon: "none" });
+      }
+    });
+  } else {
+    addLog("发射端IP未配置", "error");
+    uni.showToast({ title: "请先配置发射端IP", icon: "none" });
+  }
+
+  const rxList = receivers.value;
+  for (let i = 0; i < rxList.length; i++) {
+    const rx = rxList[i];
+    if (rx.ip.trim().length > 0) {
+      uni.request({
+        method: "GET",
+        url: rxBase(rx.ip) + "/ack",
+        timeout: 5000,
+        success: (res: any) => {
+          addLog("接收端 " + rx.name + " 连接成功: " + JSON.stringify(res), "success");
+          uni.showToast({ title: rx.name + "连接成功", icon: "none" });
+        },
+        fail: (err: any) => {
+          addLog("接收端 " + rx.name + " 连接失败: " + JSON.stringify(err), "error");
+          uni.showToast({ title: rx.name + "连接失败", icon: "none" });
+        }
+      });
+    } else {
+      addLog("接收端 " + rx.name + " IP未配置", "error");
+    }
+  }
+}
+
+// ========== 生命周期 ==========
 onMounted(() => {
   addLog("应用启动", "info");
   loadSettings();
 
-  // 先恢复并展示缓存状态，稍后再进行在线同步
   setTimeout(() => {
     syncTx();
   }, 800);
@@ -611,7 +619,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   persistPageState();
-  if (timer.value !== null) clearInterval(timer.value);
+  clearInterval(timer.value);
 });
 
 onHide(() => {
@@ -637,7 +645,7 @@ onHide(() => {
   --info-color: #3b82f6;
   --shadow: 0 2rpx 8rpx rgba(0, 0, 0, 0.08);
 
-  min-height: 100vh;
+  min-height: var(--window-height);
   background-color: var(--bg-secondary);
   color: var(--text-primary);
   transition: background-color 0.3s, color 0.3s;
@@ -654,7 +662,7 @@ onHide(() => {
   background: var(--bg-primary);
   border-bottom: 1rpx solid var(--border-color);
   padding: 24rpx;
-  position: sticky;
+  position: relative;
   top: 0;
   z-index: 100;
   box-shadow: var(--shadow);
@@ -716,8 +724,7 @@ onHide(() => {
 
 /* ===== 设备控制网格 ===== */
 .devices-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
+  display: flex; flex-wrap: wrap;
   gap: 12rpx;
 }
 
@@ -875,37 +882,16 @@ onHide(() => {
   color: var(--error-color);
 }
 
-.btn-calibrate {
-  background: rgba(245, 158, 11, 0.1);
-  color: var(--warning-color);
-  border: 1rpx solid rgba(245, 158, 11, 0.3);
-  border-radius: 8rpx;
-  padding: 6rpx 12rpx;
-  font-size: 18rpx;
-  cursor: pointer;
-  white-space: nowrap;
-}
-
-.btn-calibrate:active {
-  background: var(--warning-color);
-  color: #ffffff;
-}
-
-.btn-calibrate:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-
 /* ===== 按钮样式 ===== */
 .btn {
   border: none;
   border-radius: 12rpx;
-  padding: 12rpx 24rpx;
+  padding: 6rpx 12rpx;
   font-size: 24rpx;
   font-weight: 500;
   cursor: pointer;
   transition: all 0.3s;
-  display: inline-flex;
+  display: flex;
   align-items: center;
   justify-content: center;
 }
@@ -990,7 +976,6 @@ onHide(() => {
 /* ===== 响应式设计 ===== */
 @media (max-width: 768px) {
   .devices-grid {
-    grid-template-columns: 1fr 1fr;
   }
 
   .receiver-item {
@@ -1005,7 +990,6 @@ onHide(() => {
 
 @media (max-width: 480px) {
   .devices-grid {
-    grid-template-columns: 1fr;
   }
 
   .header-content {
@@ -1017,36 +1001,4 @@ onHide(() => {
     font-size: 28rpx;
   }
 }
-
-/* ===== 动画 ===== */
-@keyframes pulse {
-  0%, 100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.7;
-  }
-}
-
-/* ===== 滚动条样式 ===== */
-::-webkit-scrollbar {
-  width: 8rpx;
-}
-
-::-webkit-scrollbar-track {
-  background: var(--bg-secondary);
-}
-
-::-webkit-scrollbar-thumb {
-  background: var(--border-color);
-  border-radius: 4rpx;
-}
-
-::-webkit-scrollbar-thumb:hover {
-  background: var(--text-tertiary);
-}
-
 </style>
-
-
-
